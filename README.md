@@ -25,13 +25,15 @@ Optional extras: live axle loads, overload protection and an automatic mode base
 
 ## Installation
 
-1. Download `Lift Axle Extension.dll` from the [Releases](../../releases) page.
+1. Download `LiftAxleExtension.dll` from the [Releases](../../releases) page.
 2. Copy it to `<ETS2 folder>\bin\win_x64\plugins\`
    (create the `plugins` folder if it doesn't exist).
    In Steam: right-click ETS2 → *Manage* → *Browse local files*.
 3. Start the game. ETS2 shows a message that SDK plugins are active – click **OK**.
 
-**Uninstall:** delete `Lift Axle Extension.dll` and `axlelift.ini` from the `plugins` folder.
+**Uninstall:** delete `LiftAxleExtension.dll` and `axlelift.ini` from the `plugins` folder.
+
+**Updating:** replace the DLL. Make sure only **one** copy of the plugin is in the `plugins` folder.
 
 ## First use
 
