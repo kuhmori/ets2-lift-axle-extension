@@ -122,6 +122,7 @@ void ResetTargets(Vehicle& v)
     Wipe(v.wheelTargets);
     Wipe(v.altLists);
     v.probeNeeded = false;
+    v.verifyNeeded = false;
     v.loadArray = 0; v.loadReversed = false;
     Wipe(v.loadSnap); v.loadSnapPos.clear(); v.loadSnapBase = 0; v.loadSnapAt = 0.0;
     for (auto& a : v.axles) { a.controlled = false; a.releasing = false; }
@@ -133,6 +134,15 @@ void RescanVehicle(unsigned slot)
     Vehicle& v = g_vehicles[slot];
     ResetTargets(v);
     if (!v.axles.empty()) { v.scanArmed = true; v.lastL = -1.0f; }
+}
+
+void DataLost(unsigned slot)
+{
+    if (slot >= VEHICLE_COUNT) return;
+    Vehicle& v = g_vehicles[slot];
+    Log(SCS_LOG_TYPE_warning, "[axlelift] %s: the game no longer uses the old lift data (vehicle rebuilt)", v.name);
+    RescanVehicle(slot);
+    Notify("%s changed (cargo loaded?) - lift or lower the axles once with the game key", v.name);
 }
 
 static bool ClaimedByOther(const Vehicle& self, uintptr_t addr)
@@ -307,6 +317,7 @@ static void FindLoads(Vehicle& v, double now)
 // ---------------------------------------------------------------------------
 struct ProbeState {
     bool active = false;
+    bool verify = false;              // only checking that one vehicle's data is still live
     std::vector<std::pair<uintptr_t, bool>> lists;
     std::vector<unsigned> slots;
     size_t idx = 0;
@@ -338,6 +349,16 @@ static void ProbeAbort(const char* why)
 static void ProbeFinish()
 {
     ProbeState& p = g_probe;
+    if (p.verify) {                   // one vehicle, one list: did its wheel react?
+        unsigned s = p.slots[0];
+        Vehicle& v = g_vehicles[s];
+        v.verifyNeeded = false;
+        bool live = !p.owner.empty() && p.owner[0] == (int)s;
+        g_probe = ProbeState{};
+        if (live) LogDebug("[axlelift] %s: lift data still live", v.name);
+        else DataLost(s);
+        return;
+    }
     std::vector<int> listOf(VEHICLE_COUNT, -1);
     // each list -> the trailer that reacted clearly; one list per trailer
     for (size_t i = 0; i < p.lists.size(); ++i) {
@@ -390,6 +411,28 @@ static void ProbeTick()
     ProbeState& p = g_probe;
     if (g_blocked) { if (p.active) ProbeAbort("multiplayer"); return; }
 
+    if (!p.active) {
+        // re-sent vehicle (cargo loaded, ...): nudge its own list once and see if the wheel reacts
+        for (const Vehicle& v : g_vehicles) {
+            if (!v.present || !v.found || !v.verifyNeeded || v.probeNeeded) continue;
+            if (!v.offsetSeen) { g_vehicles[v.slot].verifyNeeded = false; continue; }   // can't check without wheel heights
+            bool still = true;
+            for (auto& a : v.axles) {
+                float gl = v.wheels[a.wheels[0]].gameLift;
+                if (a.controlled || (gl > 0.001f && gl < 0.999f)) still = false;
+            }
+            if (!still) continue;
+            p = ProbeState{};
+            p.active = true;
+            p.verify = true;
+            p.slots.push_back(v.slot);
+            p.lists.push_back({ v.axleList, v.listReversed });
+            p.owner.assign(1, -1);
+            p.ownerReact.assign(1, 0.0f);
+            LogDebug("[axlelift] %s: checking the lift data after a change", v.name);
+            break;
+        }
+    }
     if (!p.active) {
         std::vector<unsigned> slots;
         for (const Vehicle& v : g_vehicles) {

@@ -31,7 +31,7 @@
 #include "common/scssdk_telemetry_truck_common_channels.h"
 #include "common/scssdk_telemetry_trailer_common_channels.h"
 
-#define AXLELIFT_VERSION "1.0.0-beta2"
+#define AXLELIFT_VERSION "1.0.0-beta4"
 
 // ---------------------------------------------------------------------------
 // limits
@@ -138,6 +138,9 @@ struct Axle {
     float lastGameLift = 0.0f;    // to notice the game's own lift key
     double autoSince = 0.0;       // auto mode: condition stable since
     double realismSince = 0.0;    // realism: overload since
+    bool  checking = false;       // a plugin move is running: does the real wheel follow?
+    float checkFrom = 0.0f;       // position where that move started
+    float checkOffset = 0.0f;     // telemetry wheel height at that moment
 };
 
 struct WheelTarget { uintptr_t obj; uint64_t vtbl; unsigned wheel; };
@@ -161,6 +164,8 @@ struct Vehicle {
     bool uncertain = false;       // several identical trailers matched - assignment may be swapped
     std::vector<std::pair<uintptr_t, bool>> altLists;  // all matching lift lists (identical trailers)
     bool probeNeeded = false;     // find out which list is ours by a tiny test movement
+    bool verifyNeeded = false;    // the game re-sent this vehicle (e.g. cargo loaded): is our data still live?
+    bool offsetSeen = false;      // the game reports wheel heights for this vehicle (needed for the checks)
     uintptr_t axleList = 0;       // one float per axle: lift position
     bool listReversed = false;    // axle list is rear-to-front
     std::vector<WheelTarget> wheelTargets;
@@ -201,6 +206,7 @@ bool ReadMem(uintptr_t addr, void* out, size_t n);
 bool WriteFloat(uintptr_t addr, float v);
 void ScanTick();                      // per frame: arm / scan / refine / detect
 void RescanVehicle(unsigned slot);
+void DataLost(unsigned slot);         // our memory no longer drives this vehicle: set up again
 void ResetTargets(Vehicle& v);
 bool ProbeActive();                   // telling identical trailers apart right now
 void WriteDiagnostics();              // research export (debug section)

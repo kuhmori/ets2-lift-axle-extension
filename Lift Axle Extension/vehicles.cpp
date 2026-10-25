@@ -50,7 +50,11 @@ void OnVehicleConfig(const char* id, const scs_named_value_t* attributes)
     bool same = v.present && count == v.wheelCount;
     for (unsigned i = 0; same && i < count; ++i)
         same = wheels[i].liftable == v.wheels[i].liftable && std::fabs(wheels[i].posZ - v.wheels[i].posZ) < 0.01f;
-    if (same) return;
+    if (same) {
+        // same layout, but the game may have rebuilt the vehicle (e.g. loading cargo) -> check it
+        if (v.found) { v.verifyNeeded = true; LogDebug("[axlelift] %s re-sent by the game - checking the lift data", v.name); }
+        return;
+    }
 
     ResetTargets(v);
     v.axles.clear();
@@ -128,6 +132,14 @@ static unsigned GroundAxles(const Vehicle& v, int extraLifted)
     return std::max(down, 1u);
 }
 
+// remember where a plugin move starts, to check that the real wheel follows (see UpdateAxles)
+static void StartMove(const Vehicle& v, Axle& a)
+{
+    a.checking = true;
+    a.checkFrom = a.pos;
+    a.checkOffset = v.wheels[a.wheels[0]].liftOffset;
+}
+
 static void TakeControl(Vehicle& v, Axle& a)
 {
     if (a.controlled) return;
@@ -148,7 +160,7 @@ void ToggleAxle(unsigned slot, unsigned axle)
     if (!v.present || axle >= v.axles.size()) return;
     if (g_blocked) { Notify("Disabled: %s", g_blockedReason); return; }
     if (!v.found) { Notify("%s: lift or lower the axles once with the game key to finish setup", v.name); return; }
-    if (ProbeActive()) { Notify("One moment - telling the trailers apart"); return; }
+    if (ProbeActive()) { Notify("One moment - checking the lift data"); return; }
 
     Axle& a = v.axles[axle];
     bool wantUp = !AxleUiUp(v, a);
@@ -168,6 +180,7 @@ void ToggleAxle(unsigned slot, unsigned axle)
     a.desiredUp = wantUp;
     a.releasing = false;
     a.autoSince = 0.0;
+    StartMove(v, a);
     LogDebug("[axlelift] %s axle %u -> %s", v.name, axle + 1, wantUp ? "UP" : "DOWN");
 }
 
@@ -208,6 +221,7 @@ static void Automation(Vehicle& v, double now)
                 if (now - a.realismSince > 2.0 && !changedThisFrame) {
                     TakeControl(v, a);
                     a.desiredUp = false; a.releasing = false;
+                    StartMove(v, a);
                     a.realismSince = 0.0;
                     changedThisFrame = true;
                     Notify("%s axle %d lowered: %.1f t per axle is above the %.1f t limit", v.name, i + 1, perAxle, s.maxAxleLoadT);
@@ -235,6 +249,7 @@ static void Automation(Vehicle& v, double now)
         if (now - a.autoSince < 3.0 || changedThisFrame) continue;
         TakeControl(v, a);
         a.desiredUp = want == 1;
+        StartMove(v, a);
         a.releasing = false;
         a.autoSince = 0.0;
         changedThisFrame = true;
@@ -320,6 +335,19 @@ void UpdateAxles(float dt)
 
         Automation(v, now);
         if (!WriteVehicle(v)) continue;
+
+        // does the real wheel follow our moves? If the game rebuilt the vehicle (e.g. cargo loaded),
+        // we'd be writing into memory it no longer uses. Only possible if the game reports wheel heights.
+        for (unsigned w = 0; w < v.wheelCount; ++w)
+            if (v.wheels[w].liftable && v.wheels[w].liftOffset > 0.01f) v.offsetSeen = true;
+        bool lost = false;
+        for (auto& a : v.axles) {
+            if (!a.checking || !a.controlled) { a.checking = false; continue; }
+            if (std::fabs(a.pos - a.checkFrom) < 0.5f) continue;
+            a.checking = false;
+            if (v.offsetSeen && std::fabs(v.wheels[a.wheels[0]].liftOffset - a.checkOffset) < 0.01f) lost = true;
+        }
+        if (lost) { DataLost(s); continue; }
 
         for (auto& a : v.axles)
             if (a.controlled && a.releasing && std::fabs(a.pos - GameLift(v, a)) < 0.001f) {

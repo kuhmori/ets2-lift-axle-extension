@@ -6,7 +6,7 @@ Optional extras: live axle loads, overload protection and an automatic mode base
 
 > **Single-player only.** The plugin switches itself off in TruckersMP and in Convoy sessions.
 
-> **Status:** beta. Tested with ETS2 **1.61.1.9** on Windows 11, DirectX 11 renderer.
+> **Status:** beta (1.0.0-beta4, see [CHANGELOG](CHANGELOG.md)). Tested with ETS2 **1.61.1.9** on Windows 11, DirectX 11 renderer.
 
 ---
 
@@ -73,7 +73,7 @@ Automatic mode is switched on per axle with the *Auto* checkbox in the overlay.
 ## Known limitations
 
 - **Game's own lift key after using the plugin:** the game remembers its own lift state and doesn't know what the plugin changed. Pressing the game's key may then only cause a short bounce. Click **Release to game** (or `Alt+0`) first – after that the game's key works normally again.
-- **First lift needed** after coupling a trailer (see *First use*).
+- **First lift needed** after coupling a trailer (see *First use*) and again after loading cargo, because the game rebuilds the trailer. The overlay tells you when.
 - **DirectX 11 only** for the overlay (the game's default renderer). Keys work regardless.
 - **ETS2 only** for now – American Truck Simulator is not supported yet.
 - Other game versions than the one listed above are untested. The overlay shows a note if your version is untested.
