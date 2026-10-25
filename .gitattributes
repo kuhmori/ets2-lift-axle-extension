@@ -1,0 +1,9 @@
+# keep Windows line endings for Visual Studio files on every platform
+* text=auto
+*.cpp     text eol=crlf
+*.c       text eol=crlf
+*.h       text eol=crlf
+*.vcxproj text eol=crlf
+*.filters text eol=crlf
+*.slnx    text eol=crlf
+*.md      text eol=crlf

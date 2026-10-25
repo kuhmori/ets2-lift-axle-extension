@@ -1,0 +1,28 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.aps
+*.ipch
+ipch/
+
+# build output
+x64/
+Debug/
+Release/
+*.obj
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+*.exp
+*.lib
+*.tlog
+*.log
+*.recipe
+
+# local test files written by the plugin
+axlelift.ini
+axlelift_diagnostics.txt
