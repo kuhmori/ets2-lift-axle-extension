@@ -1,16 +1,15 @@
 name: Build
 
 # Every push / pull request: build the DLL (download it from the run's "Artifacts").
-# Pushing a tag like v1.0.0 or v1.0.0-beta2: build + create a DRAFT release with the DLL attached.
+# Releases are created by hand.
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -42,15 +41,3 @@ jobs:
         with:
           name: LiftAxleExtension
           path: dist/
-
-      - name: Draft release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: true
-          prerelease: ${{ contains(github.ref_name, 'beta') }}
-          name: Lift Axle Extension ${{ github.ref_name }}
-          body_path: RELEASE_NOTES.md
-          files: |
-            dist/LiftAxleExtension.dll
-            LiftAxleExtension.zip
