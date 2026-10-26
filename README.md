@@ -2,11 +2,11 @@
 
 Lift every lift axle of your truck and trailers **on its own** – not just all of them at once.
 Control them from an in-game overlay, with keyboard shortcuts or with buttons on your wheel / gamepad.
-Optional extras: live axle loads, overload protection and an automatic mode based on EU axle-load rules.
+Optional automatic mode lifts or lowers chosen axles while reversing.
 
 > **Single-player only.** The plugin switches itself off in TruckersMP and in Convoy sessions.
 
-> **Status:** beta (1.0.0-beta4, see [CHANGELOG](CHANGELOG.md)). Tested with ETS2 **1.61.1.9** on Windows 11, DirectX 11 renderer.
+> **Status:** beta (1.0.0-beta5, see [CHANGELOG](CHANGELOG.md)). Tested with ETS2 **1.61.1.9** on Windows 11, DirectX 11 renderer.
 
 ---
 
@@ -16,9 +16,8 @@ Optional extras: live axle loads, overload protection and an automatic mode base
 - **In-game overlay** (`Alt+O`) drawn inside the game, like the developer console. While it is open the mouse moves the overlay cursor instead of the camera
 - **Smooth movement** – axles move like the game's own animation (adjustable time)
 - **Keybinds** – a keyboard shortcut and a wheel / gamepad button for every axle and for "release all", set in the overlay
-- **Axle loads** (optional) – load per axle in tonnes, measured by the game's physics
-- **Overload protection** (optional) – an axle can't be lifted if the remaining axles would carry more than the limit, and comes down if the limit is exceeded
-- **Automatic mode** (optional, per axle) – lifts and lowers by load like a real lift-axle control; optional rule for reversing
+- **Steerable lift axles** – work normally; the plugin uses the game's own lift action where it can, so steering isn't locked
+- **Automatic mode** (optional, per axle) – lift or lower the axle while reversing, back to the previous state when driving forward
 - **Release to game** – axles glide back to the game's own state and the game takes over again
 - **Identical trailers** (e.g. B-doubles) are told apart automatically
 - **No fixed memory addresses** – the plugin recognises the game's lift data by its behaviour every time. If a game update changes it, the plugin says "not recognised" and does nothing instead of writing to the wrong place
@@ -62,10 +61,6 @@ Everything is set in the overlay (*Settings*) and saved in `axlelift.ini` next t
 |---|---|---|
 | Lift / lower time | 2.0 s | |
 | Overlay mouse speed | 1.0 | |
-| Show axle loads | off | loads appear after the first lift / lower |
-| Overload protection | off | max **9.0 t** per axle (EU: 9 t per axle in a tandem) |
-| Automatic mode: lift below | 7.0 t | per axle on the ground |
-| Automatic mode: lower above | 8.5 t | real controls lower *before* the legal limit |
 | Automatic mode: when reversing | no change | or always lower / always lift |
 
 Automatic mode is switched on per axle with the *Auto* checkbox in the overlay.
@@ -99,7 +94,7 @@ Everything needed is in this repository (SCS SDK headers, Dear ImGui, MinHook).
 
 - The game's telemetry SDK reports each wheel's lift state and the vehicle layout.
 - When the axles move with the game's key, the plugin searches the game's memory for values that follow exactly the same movement and recognises the per-axle lift list that drives the physics. Nothing is hard-coded.
-- The plugin then writes its own lift positions into that list. Axle loads are found next to it by watching how the load moves when an axle lifts.
+- The plugin then writes its own lift positions into that list. When a change matches what the game's own lift key would do, it presses that key through the SDK input API instead, so the game keeps its own state (steering of steerable axles) in sync.
 - The overlay is drawn with Dear ImGui inside the game's DirectX 11 frame; mouse input is taken from the game's DirectInput mouse while the overlay is open.
 
 ## Credits & licences

@@ -1,5 +1,5 @@
 // vehicles: telemetry layout, axle control (animation, release, game-key handover),
-// automatic mode, realism (overload protection), axle loads
+// automatic mode (reversing rule)
 #include "common.h"
 
 Vehicle g_vehicles[VEHICLE_COUNT];
@@ -103,35 +103,6 @@ static unsigned MemIndex(const Vehicle& v, unsigned allIndex, bool reversed)
     return reversed ? (unsigned)v.axleZ.size() - 1 - allIndex : allIndex;
 }
 
-// load on an axle (newtons in memory -> tonnes); < 0 = unknown
-float AxleLoadT(const Vehicle& v, unsigned allIndex)
-{
-    if (!v.loadArray || allIndex >= v.axleZ.size()) return -1.0f;
-    float n;
-    if (!ReadMem(v.loadArray + 4 * MemIndex(v, allIndex, v.loadReversed), &n, 4) || !std::isfinite(n) || n < -1000.0f) return -1.0f;
-    return std::max(n, 0.0f) / 9.81f / 1000.0f;
-}
-
-static bool VehicleLoads(const Vehicle& v, float& total)
-{
-    total = 0.0f;
-    for (unsigned k = 0; k < v.axleZ.size(); ++k) {
-        float t = AxleLoadT(v, k);
-        if (t < 0.0f) return false;
-        total += t;
-    }
-    return total > 0.05f;
-}
-
-// axles on the ground, optionally pretending one more axle is lifted
-static unsigned GroundAxles(const Vehicle& v, int extraLifted)
-{
-    unsigned down = (unsigned)v.axleZ.size();
-    for (unsigned i = 0; i < v.axles.size(); ++i)
-        if (AxleUiUp(v, v.axles[i]) || (int)i == extraLifted) --down;
-    return std::max(down, 1u);
-}
-
 // remember where a plugin move starts, to check that the real wheel follows (see UpdateAxles)
 static void StartMove(const Vehicle& v, Axle& a)
 {
@@ -151,6 +122,41 @@ static void TakeControl(Vehicle& v, Axle& a)
 }
 
 // ---------------------------------------------------------------------------
+// Let the game do the move with its own lift action when that's clean: every lift axle the
+// game's key controls (truck: the truck, trailer key: all trailers) is where the game thinks
+// it is, and all of them flip. Then the game's state, steering lock of steerable lift axles,
+// dashboard light and its own key stay right. Anything else is done by the plugin as before.
+// ---------------------------------------------------------------------------
+static bool TryGameLift(unsigned slot, unsigned axle, bool wantUp)
+{
+    bool trailerKey = slot != 0;
+    unsigned count = 0;
+    for (unsigned s = 0; s < VEHICLE_COUNT; ++s) {
+        if ((s != 0) != trailerKey) continue;
+        const Vehicle& v = g_vehicles[s];
+        if (!v.present || v.axles.empty()) continue;
+        if (!v.found) return false;                        // can't follow it - leave it to the plugin
+        for (unsigned i = 0; i < v.axles.size(); ++i) {
+            const Axle& a = v.axles[i];
+            float gl = GameLift(v, a);
+            if (gl > 0.001f && gl < 0.999f) return false;  // game is moving it right now
+            if (a.controlled && (a.releasing || std::fabs(a.pos - gl) > 0.001f)) return false;  // not where the game thinks
+            bool gameUp = gl > 0.5f;
+            bool result = (s == slot && i == axle) ? wantUp : gameUp;
+            if (result == gameUp) return false;            // this one would not flip -> mixed result
+            ++count;
+        }
+    }
+    if (!count || !PressGameLift(trailerKey)) return false;
+    for (unsigned s = 0; s < VEHICLE_COUNT; ++s) {
+        if ((s != 0) != trailerKey) continue;
+        for (auto& a : g_vehicles[s].axles) { a.controlled = false; a.releasing = false; a.checking = false; }
+    }
+    LogDebug("[axlelift] %s axle %u -> %s (done by the game's lift action)", g_vehicles[slot].name, axle + 1, wantUp ? "UP" : "DOWN");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // player actions
 // ---------------------------------------------------------------------------
 void ToggleAxle(unsigned slot, unsigned axle)
@@ -164,18 +170,7 @@ void ToggleAxle(unsigned slot, unsigned axle)
 
     Axle& a = v.axles[axle];
     bool wantUp = !AxleUiUp(v, a);
-
-    if (wantUp && g_settings.realism) {
-        float total;
-        if (VehicleLoads(v, total)) {
-            float after = total / (float)GroundAxles(v, (int)axle);
-            if (after > g_settings.maxAxleLoadT) {
-                Notify("%s axle %u stays down: the other axles would carry %.1f t each (limit %.1f t)",
-                       v.name, axle + 1, after, g_settings.maxAxleLoadT);
-                return;
-            }
-        }
-    }
+    if (TryGameLift(slot, axle, wantUp)) return;
     TakeControl(v, a);
     a.desiredUp = wantUp;
     a.releasing = false;
@@ -198,14 +193,13 @@ void ReleaseAll()
 }
 
 // ---------------------------------------------------------------------------
-// automatic mode + realism (needs axle loads, reverse rule only needs the gear)
+// automatic mode (per axle): lift or lower when reversing, back to the previous state when
+// driving forward again
 // ---------------------------------------------------------------------------
 static void Automation(Vehicle& v, double now)
 {
     if (ProbeActive()) return;
     const Settings& s = g_settings;
-    float total = 0.0f;
-    bool loads = VehicleLoads(v, total);
     bool changedThisFrame = false;
 
     // rear axles first: they are usually the ones lifted
@@ -213,42 +207,29 @@ static void Automation(Vehicle& v, double now)
         Axle& a = v.axles[i];
         bool up = AxleUiUp(v, a);
 
-        // realism: an axle that is up while the others are overloaded comes down
-        if (s.realism && s.realismAutoLower && loads && up) {
-            float perAxle = total / (float)GroundAxles(v, -1);
-            if (perAxle > s.maxAxleLoadT) {
-                if (a.realismSince == 0.0) a.realismSince = now;
-                if (now - a.realismSince > 2.0 && !changedThisFrame) {
-                    TakeControl(v, a);
-                    a.desiredUp = false; a.releasing = false;
-                    StartMove(v, a);
-                    a.realismSince = 0.0;
-                    changedThisFrame = true;
-                    Notify("%s axle %d lowered: %.1f t per axle is above the %.1f t limit", v.name, i + 1, perAxle, s.maxAxleLoadT);
-                }
-                continue;
-            }
-        }
-        a.realismSince = 0.0;
-
-        if (!s.axleAuto[v.slot][i]) { a.autoSince = 0.0; continue; }
+        if (!s.axleAuto[v.slot][i]) { a.autoSince = 0.0; a.revActive = false; continue; }
 
         // what should this axle do?
         int want = -1; // -1 = no opinion, 0 = down, 1 = up
-        if (g_truckGear < 0 && s.autoReverse != ReverseRule::None) {
+        bool reversing = g_truckGear < 0;
+        bool forward = g_truckGear > 0 || (g_truckGear == 0 && g_truckSpeed > 0.5f);
+        if (reversing && s.autoReverse != ReverseRule::None) {
+            if (!a.revActive) { a.revActive = true; a.revRestoreUp = up; }   // remember how it was
             want = s.autoReverse == ReverseRule::Lift ? 1 : 0;
-        } else if (loads) {
-            if (up) want = (total / (float)GroundAxles(v, -1) > s.autoLowerAboveT) ? 0 : 1;
-            else    want = (total / (float)GroundAxles(v, i) <= s.autoLiftBelowT) ? 1 : 0;
+        } else if (a.revActive && (forward || s.autoReverse == ReverseRule::None)) {
+            want = a.revRestoreUp ? 1 : 0;                                    // driving forward again: back to before
+            if ((want == 1) == up) { a.revActive = false; a.autoSince = 0.0; continue; }
+        } else if (a.revActive) {
+            continue;                                                         // neutral / stopped: keep it as it is
         }
-        if (want == 1 && s.realism && loads && total / (float)GroundAxles(v, i) > s.maxAxleLoadT) want = 0;
         if (want < 0 || (want == 1) == up) { a.autoSince = 0.0; continue; }
 
         // condition must hold for a moment (no flapping over bumps); one change per vehicle per frame
         if (a.autoSince == 0.0) a.autoSince = now;
-        if (now - a.autoSince < 3.0 || changedThisFrame) continue;
+        if (now - a.autoSince < 1.0 || changedThisFrame) continue;
         TakeControl(v, a);
         a.desiredUp = want == 1;
+        if (!reversing) a.revActive = false;                                // restored
         StartMove(v, a);
         a.releasing = false;
         a.autoSince = 0.0;
@@ -381,7 +362,5 @@ void SwapWithNext(unsigned slot)
     std::swap(a.axleList, b.axleList);
     std::swap(a.listReversed, b.listReversed);
     std::swap(a.wheelTargets, b.wheelTargets);
-    std::swap(a.loadArray, b.loadArray);
-    std::swap(a.loadReversed, b.loadReversed);
     Notify("%s and %s swapped", a.name, b.name);
 }

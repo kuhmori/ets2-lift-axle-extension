@@ -12,14 +12,13 @@
 // ---------------------------------------------------------------------------
 // state shared between the game thread (publishes) and the render thread (draws)
 // ---------------------------------------------------------------------------
-struct UiAxle { float pos = 0; bool up = false, controlled = false, releasing = false; float load = -1; };
+struct UiAxle { float pos = 0; bool up = false, controlled = false, releasing = false; };
 struct UiVehicle {
     bool present = false, found = false, scanning = false, uncertain = false, canSwap = false, notRecognised = false, probing = false;
     char name[24] = "";
     unsigned axleCount = 0, allCount = 0, wheelObjects = 0;
     UiAxle axles[MAX_LIFT_AXLES];
-    float loads[16]; bool loadsKnown = false; float totalLoad = 0;
-    uintptr_t list = 0, loadArray = 0;
+    uintptr_t list = 0;
     int allIndex[MAX_LIFT_AXLES] = {};
 };
 struct UiState {
@@ -77,21 +76,14 @@ void OverlayPublish()
         u.axleCount = (unsigned)v.axles.size();
         u.allCount = (unsigned)std::min<size_t>(v.axleZ.size(), 16);
         u.wheelObjects = (unsigned)v.wheelTargets.size();
-        u.list = v.axleList; u.loadArray = v.loadArray;
+        u.list = v.axleList;
         for (unsigned i = 0; i < u.axleCount; ++i) {
             const Axle& a = v.axles[i];
             u.axles[i].pos = AxleUiPos(v, a);
             u.axles[i].up = AxleUiUp(v, a);
             u.axles[i].controlled = a.controlled;
             u.axles[i].releasing = a.releasing;
-            u.axles[i].load = AxleLoadT(v, a.allIndex);
             u.allIndex[i] = (int)a.allIndex;
-        }
-        u.loadsKnown = v.loadArray != 0;
-        u.totalLoad = 0;
-        for (unsigned k = 0; k < u.allCount; ++k) {
-            u.loads[k] = AxleLoadT(v, k);
-            if (u.loads[k] < 0) u.loadsKnown = false; else u.totalLoad += u.loads[k];
         }
     }
     std::lock_guard<std::mutex> lock(g_uiMutex);
@@ -119,9 +111,7 @@ void RunCommands()
         case CmdType::ClearBind: ClearBind(c.value); break;
         case CmdType::ApplySettings: {
             Settings& s = g_settings; const Settings& n = c.settings;
-            s.liftSeconds = n.liftSeconds; s.showLoads = n.showLoads; s.overlayMouseSpeed = n.overlayMouseSpeed;
-            s.realism = n.realism; s.maxAxleLoadT = n.maxAxleLoadT; s.realismAutoLower = n.realismAutoLower;
-            s.autoLiftBelowT = n.autoLiftBelowT; s.autoLowerAboveT = std::max(n.autoLowerAboveT, n.autoLiftBelowT);
+            s.liftSeconds = n.liftSeconds; s.overlayMouseSpeed = n.overlayMouseSpeed;
             s.autoReverse = n.autoReverse; s.verboseLog = n.verboseLog; s.showDebug = n.showDebug;
             SaveSettings();
             break;
@@ -238,11 +228,9 @@ static void DrawVehicle(const UiState& st, unsigned slot)
         if (ImGui::SmallButton("Swap with next trailer")) Cmd(CmdType::SwapTrailers, slot);
     }
 
-    int cols = s.showLoads ? 6 : 5;
-    if (ImGui::BeginTable("axles", cols, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+    if (ImGui::BeginTable("axles", 5, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
         ImGui::TableSetupColumn("Axle", ImGuiTableColumnFlags_WidthFixed, 120);
         ImGui::TableSetupColumn("Position", ImGuiTableColumnFlags_WidthFixed, 120);
-        if (s.showLoads) ImGui::TableSetupColumn("Load", ImGuiTableColumnFlags_WidthFixed, 60);
         ImGui::TableSetupColumn("Auto", ImGuiTableColumnFlags_WidthFixed, 40);
         ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 110);
         ImGui::TableSetupColumn("Controller", ImGuiTableColumnFlags_WidthFixed, 150);
@@ -266,15 +254,10 @@ static void DrawVehicle(const UiState& st, unsigned slot)
             ImGui::ProgressBar(std::min(std::max(a.pos, 0.0f), 1.0f), ImVec2(-FLT_MIN, 0), state);
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("* = controlled by this plugin");
 
-            if (s.showLoads) {
-                ImGui::TableNextColumn();
-                if (a.load >= 0) ImGui::Text("%.1f t", a.load); else ImGui::TextDisabled("-");
-            }
-
             ImGui::TableNextColumn();
             bool autoOn = s.axleAuto[slot][i];
             if (ImGui::Checkbox("##auto", &autoOn)) Cmd(CmdType::SetAuto, slot, i, autoOn ? 1 : 0);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Automatic mode for this axle (rules in Settings)");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Automatic mode for this axle: lift or lower it when reversing (set in Settings)");
 
             ImGui::TableNextColumn();
             char t[64]; KeyBindText(s.axle[slot][i].key, t, sizeof(t));
@@ -289,16 +272,6 @@ static void DrawVehicle(const UiState& st, unsigned slot)
     ImGui::BeginDisabled(!u.found || st.blocked);
     if (ImGui::Button("Release to game")) Cmd(CmdType::ReleaseVehicle, slot);
     ImGui::EndDisabled();
-    if (s.showLoads) {
-        ImGui::SameLine();
-        if (u.loadsKnown) {
-            ImGui::Text("  Axle loads:");
-            for (unsigned k = 0; k < u.allCount; ++k) { ImGui::SameLine(); ImGui::Text("%.1f", u.loads[k]); }
-            ImGui::SameLine(); ImGui::Text("t  (total %.1f t)", u.totalLoad);
-        } else if (u.found) {
-            ImGui::TextDisabled("  Axle loads: measured after the next lift or lower");
-        }
-    }
     ImGui::Spacing();
     ImGui::PopID();
 }
@@ -315,22 +288,11 @@ static void DrawSettings(const UiState& st)
     KeyBindText(s.overlayKey, t, sizeof(t));
     ImGui::Text("Overlay key"); ImGui::SameLine(160); BindButton(t, BIND_OVERLAY, st.capture, 120);
     changed |= ImGui::SliderFloat("Overlay mouse speed", &s.overlayMouseSpeed, 0.25f, 4.0f, "%.2f");
-    changed |= ImGui::Checkbox("Show axle loads", &s.showLoads);
-
-    ImGui::SeparatorText("Realism");
-    changed |= ImGui::Checkbox("Protect the other axles from overload", &s.realism);
-    ImGui::BeginDisabled(!s.realism);
-    changed |= ImGui::SliderFloat("Max load per axle", &s.maxAxleLoadT, 3.0f, 20.0f, "%.1f t");
-    changed |= ImGui::Checkbox("Lower a lifted axle when the limit is exceeded", &s.realismAutoLower);
-    ImGui::EndDisabled();
 
     ImGui::SeparatorText("Automatic mode (axles with 'Auto' ticked)");
-    changed |= ImGui::SliderFloat("Lift while the other axles carry below", &s.autoLiftBelowT, 0.5f, 15.0f, "%.1f t");
-    changed |= ImGui::SliderFloat("Lower when the axles on the ground carry above", &s.autoLowerAboveT, 0.5f, 20.0f, "%.1f t");
-    if (s.autoLowerAboveT < s.autoLiftBelowT) s.autoLowerAboveT = s.autoLiftBelowT;
     int rev = (int)s.autoReverse;
     if (ImGui::Combo("When reversing", &rev, "No change\0Lower\0Lift\0")) { s.autoReverse = (ReverseRule)rev; changed = true; }
-    ImGui::TextDisabled("Load rules need the axle loads (measured after the first lift or lower).");
+    ImGui::TextDisabled("The axles go back to their previous state when you drive forward again.");
 
     ImGui::SeparatorText("Advanced");
     changed |= ImGui::Checkbox("Verbose log (game.log.txt)", &s.verboseLog);
@@ -350,8 +312,8 @@ static void DrawDebug(const UiState& st)
         const UiVehicle& u = st.v[s];
         if (!u.present) continue;
         ImGui::PushID((int)s);
-        ImGui::Text("%s: %s, lift data %p, loads %p, wheel objects %u", u.name, u.found ? "found" : u.scanning ? "searching" : "-",
-                    (void*)u.list, (void*)u.loadArray, u.wheelObjects);
+        ImGui::Text("%s: %s, lift data %p, wheel objects %u", u.name, u.found ? "found" : u.scanning ? "searching" : "-",
+                    (void*)u.list, u.wheelObjects);
         ImGui::SameLine();
         if (ImGui::SmallButton("Search again")) Cmd(CmdType::Rescan, s);
         ImGui::PopID();

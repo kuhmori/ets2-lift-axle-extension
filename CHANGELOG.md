@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.0-beta5
+
+### Fixed
+- Steerable lift axles stayed locked straight after the plugin lowered them, until the game's own lift key was pressed. The plugin now uses the game's own lift action whenever that gives the same result, so steering works normally. Thanks to MVD for the report.
+- Automatic mode "when reversing" did not put the axles back when driving forward again. The axles now return to their previous state once you drive forward. Thanks to Quichenic for the report.
+
+### Removed
+- Axle load display, overload protection and the load-based automatic rules. The loads read from the game's physics were not reliable enough. Automatic mode is now the reversing rule only. Old settings in `axlelift.ini` are ignored.
+
 ## 1.0.0-beta4
 
 ### Fixed

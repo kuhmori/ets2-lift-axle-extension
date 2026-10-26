@@ -1,8 +1,8 @@
-### What's new in 1.0.0-beta4
+### What's new in 1.0.0-beta5
 
-- **Fixed:** lift axles stopped responding to keys and controller buttons after loading cargo. The game rebuilds the trailer when cargo is loaded and the plugin kept using the old data. It now notices this and asks you to lift or lower the axles once with the game key to set itself up again.
-- After the game re-sends a vehicle (for example when loading cargo), the plugin checks with a tiny, invisible test movement whether its data still works.
-- Every lift or lower done by the plugin is checked against the real wheel height. If the wheel doesn't follow, the plugin sets itself up again instead of silently doing nothing.
+- **Fixed:** steerable lift axles stayed locked straight after the plugin lowered them until the game's lift key was pressed. Steering now works normally. Thanks to **MVD** for reporting it.
+- **Fixed:** automatic mode "when reversing" now puts the axles back to their previous state when you drive forward again. Thanks to **Quichenic** for reporting it.
+- **Removed:** axle load display, overload protection and the load-based automatic rules. The loads from the game's physics weren't reliable enough. Automatic mode is now the reversing rule only; old settings are ignored.
 
 Full history: [CHANGELOG.md](https://github.com/kuhmori/ets2-lift-axle-extension/blob/main/CHANGELOG.md)
 

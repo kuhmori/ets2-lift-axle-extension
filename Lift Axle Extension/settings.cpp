@@ -173,15 +173,9 @@ static bool WriteIni(const char* path)
     char t[160];
     fprintf(f, "; Lift Axle Extension %s settings. Edit in the overlay (default Alt+O) or here while the game is closed.\n", AXLELIFT_VERSION);
     fprintf(f, "; Keys: e.g. Alt+1, Ctrl+Shift+L, F6, Num3. Controller buttons are best set in the overlay.\n\n");
-    fprintf(f, "settings_version=2\n");
+    fprintf(f, "settings_version=3\n");
     fprintf(f, "lift_seconds=%.2f\n", s.liftSeconds);
     KeyBindText(s.overlayKey, t, sizeof(t)); fprintf(f, "overlay_key=%s\n", t);
-    fprintf(f, "show_loads=%d\n", s.showLoads ? 1 : 0);
-    fprintf(f, "realism=%d\n", s.realism ? 1 : 0);
-    fprintf(f, "max_axle_load_t=%.1f\n", s.maxAxleLoadT);
-    fprintf(f, "realism_auto_lower=%d\n", s.realismAutoLower ? 1 : 0);
-    fprintf(f, "auto_lift_below_t=%.1f\n", s.autoLiftBelowT);
-    fprintf(f, "auto_lower_above_t=%.1f\n", s.autoLowerAboveT);
     fprintf(f, "auto_reverse=%s\n", ReverseName(s.autoReverse));
     fprintf(f, "overlay_mouse_speed=%.2f\n", s.overlayMouseSpeed);
     fprintf(f, "verbose_log=%d\n", s.verboseLog ? 1 : 0);
@@ -207,7 +201,6 @@ static bool ReadIni(const char* path)
     if (!f) return false;
     Settings& s = g_settings;
     char line[256];
-    int version = 1;
     while (fgets(line, sizeof(line), f)) {
         char* nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
         char* eq = strchr(line, '=');
@@ -216,15 +209,9 @@ static bool ReadIni(const char* path)
         const char* k = line; const char* val = eq + 1;
         unsigned idx;
         char slot[16];
-        if (!strcmp(k, "settings_version")) version = atoi(val);
+        if (!strcmp(k, "settings_version")) (void)atoi(val);   // keys of removed features are simply ignored
         else if (!strcmp(k, "lift_seconds")) s.liftSeconds = Clampf((float)atof(val), 0.2f, 20.0f);
         else if (!strcmp(k, "overlay_key")) { KeyBind b = ParseKey(val); if (b.valid()) s.overlayKey = b; }
-        else if (!strcmp(k, "show_loads")) s.showLoads = atoi(val) != 0;
-        else if (!strcmp(k, "realism")) s.realism = atoi(val) != 0;
-        else if (!strcmp(k, "max_axle_load_t")) s.maxAxleLoadT = Clampf((float)atof(val), 1.0f, 40.0f);
-        else if (!strcmp(k, "realism_auto_lower")) s.realismAutoLower = atoi(val) != 0;
-        else if (!strcmp(k, "auto_lift_below_t")) s.autoLiftBelowT = Clampf((float)atof(val), 0.0f, 40.0f);
-        else if (!strcmp(k, "auto_lower_above_t")) s.autoLowerAboveT = Clampf((float)atof(val), 0.0f, 40.0f);
         else if (!strcmp(k, "auto_reverse")) s.autoReverse = !_stricmp(val, "lower") ? ReverseRule::Lower : !_stricmp(val, "lift") ? ReverseRule::Lift : ReverseRule::None;
         else if (!strcmp(k, "verbose_log")) s.verboseLog = atoi(val) != 0;
         else if (!strcmp(k, "overlay_mouse_speed")) s.overlayMouseSpeed = Clampf((float)atof(val), 0.1f, 10.0f);
@@ -243,13 +230,6 @@ static bool ReadIni(const char* path)
         }
     }
     fclose(f);
-    if (version < 2) {   // beta1 had placeholder values: switch to the EU-based defaults
-        Settings d;
-        s.maxAxleLoadT = d.maxAxleLoadT;
-        s.autoLiftBelowT = d.autoLiftBelowT;
-        s.autoLowerAboveT = d.autoLowerAboveT;
-    }
-    if (s.autoLowerAboveT < s.autoLiftBelowT) s.autoLowerAboveT = s.autoLiftBelowT;
     return true;
 }
 

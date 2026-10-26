@@ -24,6 +24,7 @@
 
 #include "scssdk_telemetry.h"
 #include "scssdk_telemetry_event.h"
+#include "scssdk_input.h"
 #include "eurotrucks2/scssdk_eut2.h"
 #include "eurotrucks2/scssdk_telemetry_eut2.h"
 #include "common/scssdk_telemetry_common_configs.h"
@@ -31,7 +32,7 @@
 #include "common/scssdk_telemetry_truck_common_channels.h"
 #include "common/scssdk_telemetry_trailer_common_channels.h"
 
-#define AXLELIFT_VERSION "1.0.0-beta4"
+#define AXLELIFT_VERSION "1.0.0-beta5"
 
 // ---------------------------------------------------------------------------
 // limits
@@ -87,17 +88,7 @@ enum class ReverseRule : int { None = 0, Lower = 1, Lift = 2 };
 struct Settings {
     float liftSeconds = 2.0f;
     KeyBind overlayKey{ 'O', false, true, false };
-    bool showLoads = false;
-
-    // defaults follow EU limits: 10 t single axle, 9 t per axle in a tandem, 8 t in a tridem;
-    // real lift-axle controls lower the axle before the legal limit is reached
-    bool realism = false;            // protect remaining axles from overload
-    float maxAxleLoadT = 9.0f;       // per axle on the ground
-    bool realismAutoLower = true;    // lower again if the limit is exceeded while lifted
-
-    float autoLiftBelowT = 7.0f;     // auto mode: lift if the other axles stay below this
-    float autoLowerAboveT = 8.5f;    // auto mode: lower if the axles on the ground exceed this
-    ReverseRule autoReverse = ReverseRule::None;
+    ReverseRule autoReverse = ReverseRule::None;   // automatic mode: what axles with "Auto" do when reversing
 
     float overlayMouseSpeed = 1.0f;  // overlay cursor speed (it moves with the raw mouse data)
     bool verboseLog = false;
@@ -137,7 +128,8 @@ struct Axle {
     float pos = 0.0f;             // position we write (0 down .. 1 up)
     float lastGameLift = 0.0f;    // to notice the game's own lift key
     double autoSince = 0.0;       // auto mode: condition stable since
-    double realismSince = 0.0;    // realism: overload since
+    bool  revActive = false;      // auto mode: the reversing rule is in effect
+    bool  revRestoreUp = false;   // ...and this is the state to go back to when driving forward
     bool  checking = false;       // a plugin move is running: does the real wheel follow?
     float checkFrom = 0.0f;       // position where that move started
     float checkOffset = 0.0f;     // telemetry wheel height at that moment
@@ -169,14 +161,6 @@ struct Vehicle {
     uintptr_t axleList = 0;       // one float per axle: lift position
     bool listReversed = false;    // axle list is rear-to-front
     std::vector<WheelTarget> wheelTargets;
-    uintptr_t loadArray = 0;      // one float per axle: load in newtons (0 = not found yet)
-    bool loadReversed = false;
-
-    // load finder
-    std::vector<uint8_t> loadSnap;
-    uintptr_t loadSnapBase = 0;
-    std::vector<float> loadSnapPos;
-    double loadSnapAt = 0.0;
 };
 
 extern Vehicle g_vehicles[VEHICLE_COUNT];
@@ -190,12 +174,12 @@ extern bool  g_versionTested;
 void VehiclesInit();
 void OnVehicleConfig(const char* id, const scs_named_value_t* attributes);
 void ToggleAxle(unsigned slot, unsigned axle);
+bool PressGameLift(bool trailer);     // press the game's own lift action (SDK input), false = not available
 void ReleaseVehicle(unsigned slot);
 void ReleaseAll();
 void SwapWithNext(unsigned slot);     // identical trailers: swap which memory belongs to which
 bool CanSwapWithNext(unsigned slot);
-void UpdateAxles(float dt);           // animation, game-key detection, auto + realism, writing
-float AxleLoadT(const Vehicle& v, unsigned allIndex);    // tonnes, < 0 = unknown
+void UpdateAxles(float dt);           // animation, game-key detection, automatic mode, writing
 float AxleUiPos(const Vehicle& v, const Axle& a);
 bool  AxleUiUp(const Vehicle& v, const Axle& a);
 

@@ -1,10 +1,9 @@
-// memory: find each vehicle's lift data, find axle loads, game version, research export
+// memory: find each vehicle's lift data, tell identical trailers apart, game version, research export
 //
 // Layout found on ETS2 1.61.1.9 (checked structurally at run time, never trusted blindly):
 //   axle list    one float per axle (0 = down, 1 = up), front to back; drives the physics
 //   wheel object [obj+0x00] vtable inside eurotrucks2.exe, [obj+0x20] u32 wheel index,
 //                lift float at obj+0x80 and obj+0x150 (visual / suspension)
-//   load array   one float per axle, newtons; found by watching loads move when an axle lifts
 #include "common.h"
 
 #pragma comment(lib, "version.lib")
@@ -123,8 +122,6 @@ void ResetTargets(Vehicle& v)
     Wipe(v.altLists);
     v.probeNeeded = false;
     v.verifyNeeded = false;
-    v.loadArray = 0; v.loadReversed = false;
-    Wipe(v.loadSnap); v.loadSnapPos.clear(); v.loadSnapBase = 0; v.loadSnapAt = 0.0;
     for (auto& a : v.axles) { a.controlled = false; a.releasing = false; }
 }
 
@@ -223,94 +220,6 @@ static void Detect(Vehicle& v, float L)
 }
 
 // ---------------------------------------------------------------------------
-// axle loads: snapshot memory near the lift data, compare after the axles changed
-// ---------------------------------------------------------------------------
-static const size_t LOAD_WINDOW = 256 * 1024;
-
-static void LoadSnapshot(Vehicle& v, std::vector<uint8_t>& out, uintptr_t& base)
-{
-    base = (v.axleList - LOAD_WINDOW) & ~(uintptr_t)0xFFF;
-    out.assign(2 * LOAD_WINDOW, 0);
-    for (size_t off = 0; off < out.size(); off += 4096)       // unreadable pages stay zero
-        ReadMem(base + off, &out[off], 4096);
-}
-
-static bool AxlesAtRest(const Vehicle& v, std::vector<float>& pos)
-{
-    pos.clear();
-    for (auto& a : v.axles) {
-        float p = AxleUiPos(v, a);
-        if (p > 0.001f && p < 0.999f) return false;
-        pos.push_back(p);
-    }
-    return true;
-}
-
-static void FindLoads(Vehicle& v, double now)
-{
-    if (v.loadArray || !v.axleList) return;
-    std::vector<float> pos;
-    if (!AxlesAtRest(v, pos)) { v.loadSnapAt = 0.0; return; }
-    if (v.loadSnapAt == 0.0) { v.loadSnapAt = now; return; }
-    if (now - v.loadSnapAt < 1.5) return;                 // let the suspension settle
-
-    if (v.loadSnap.empty()) {                             // first picture
-        LoadSnapshot(v, v.loadSnap, v.loadSnapBase);
-        v.loadSnapPos = pos;
-        return;
-    }
-    if (pos == v.loadSnapPos) return;                     // nothing changed yet
-
-    std::vector<uint8_t> now2; uintptr_t base2;
-    LoadSnapshot(v, now2, base2);
-    if (base2 != v.loadSnapBase) { Wipe(v.loadSnap); v.loadSnap.swap(now2); v.loadSnapBase = base2; v.loadSnapPos = pos; return; }
-
-    const unsigned n = (unsigned)v.axleZ.size();
-    auto liftedIn = [&](const std::vector<float>& p, unsigned memIdx, bool rev) {
-        unsigned all = rev ? n - 1 - memIdx : memIdx;
-        for (unsigned i = 0; i < v.axles.size(); ++i) if (v.axles[i].allIndex == all) return p[i] > 0.5f;
-        return false;
-    };
-    auto fits = [&](const uint8_t* mem, const std::vector<float>& p, bool rev, float& sum) {
-        float vals[16]; sum = 0.0f;
-        for (unsigned k = 0; k < n; ++k) {
-            memcpy(&vals[k], mem + 4 * k, 4);
-            if (!std::isfinite(vals[k]) || vals[k] < -100.0f || vals[k] > 5.0e6f) return false;
-            sum += std::max(vals[k], 0.0f);
-        }
-        if (sum < 1000.0f) return false;                   // < ~0.1 t: not a load
-        for (unsigned k = 0; k < n; ++k) {
-            bool lifted = liftedIn(p, k, rev);
-            if (lifted && vals[k] > 0.02f * sum) return false;
-            if (!lifted && vals[k] < 0.02f * sum) return false;
-        }
-        return true;
-    };
-
-    uintptr_t best = 0; bool bestRev = false; size_t bestDist = SIZE_MAX;
-    for (size_t off = 0; off + 4 * n <= now2.size(); off += 4) {
-        for (int rev = 0; rev < 2; ++rev) {
-            float s1, s2;
-            if (!fits(&v.loadSnap[off], v.loadSnapPos, rev != 0, s1) || !fits(&now2[off], pos, rev != 0, s2)) continue;
-            if (std::fabs(s1 - s2) > 0.1f * std::max(s1, s2)) continue;    // total weight is the same
-            uintptr_t addr = base2 + off;
-            size_t dist = addr > v.axleList ? addr - v.axleList : v.axleList - addr;
-            if (dist < bestDist) { best = addr; bestRev = rev != 0; bestDist = dist; }
-        }
-    }
-    if (best) {
-        v.loadArray = best;
-        v.loadReversed = bestRev;
-        Wipe(v.loadSnap);
-        LogInfo("[axlelift] %s: axle loads found at %p", v.name, (void*)best);
-    } else {
-        Wipe(v.loadSnap); v.loadSnap.swap(now2); v.loadSnapPos = pos;   // try again with the next change
-        LogDebug("[axlelift] %s: axle loads not found yet", v.name);
-    }
-    Wipe(now2);
-}
-
-// ---------------------------------------------------------------------------
 // identical trailers (e.g. a B-double) lifting together: every matching lift list looks the same.
 // Probe: nudge one list's first lift axle by 8 % for a few frames and watch which trailer's wheels
 // react in telemetry (lift offset / suspension). Always restored. Falls back to "Swap" in the overlay.
@@ -390,10 +299,9 @@ static void ProbeFinish()
         v.probeNeeded = false;
         if (listOf[s] < 0) { v.probeNeeded = wasUp; continue; }   // up: wheels in the air hardly react -> retry when down
         uintptr_t list = p.lists[listOf[s]].first;
-        if (v.axleList != list) {      // other trailer's data: take ours, measure loads again
+        if (v.axleList != list) {      // other trailer's data: take ours
             v.axleList = list;
             v.listReversed = p.lists[listOf[s]].second;
-            v.loadArray = 0; Wipe(v.loadSnap); v.loadSnapPos.clear(); v.loadSnapAt = 0.0;
         }
         v.uncertain = false;
         ++solved;
@@ -509,12 +417,11 @@ static void ProbeTick()
 void ScanTick()
 {
     bool scannedThisFrame = false; // at most one full scan per frame
-    double now = NowSeconds();
     ProbeTick();
 
     for (Vehicle& v : g_vehicles) {
         if (!v.present || v.axles.empty()) continue;
-        if (v.found) { if (!g_probe.active && !v.probeNeeded) FindLoads(v, now); continue; }
+        if (v.found) continue;
 
         float L = v.wheels[v.axles[0].wheels[0]].gameLift;
         bool atRest = L < 0.001f || L > 0.999f;
@@ -618,8 +525,8 @@ void WriteDiagnostics()
     std::vector<DiagNode> nodes;
     for (const Vehicle& v : g_vehicles) {
         if (!v.present) continue;
-        fprintf(f, "== %s (%s): %u wheels, %u axles, found=%d uncertain=%d list=%p rev=%d loads=%p alt=%zu\n", v.name, v.id,
-                v.wheelCount, (unsigned)v.axleZ.size(), v.found, v.uncertain, (void*)v.axleList, v.listReversed, (void*)v.loadArray, v.altLists.size());
+        fprintf(f, "== %s (%s): %u wheels, %u axles, found=%d uncertain=%d list=%p rev=%d alt=%zu\n", v.name, v.id,
+                v.wheelCount, (unsigned)v.axleZ.size(), v.found, v.uncertain, (void*)v.axleList, v.listReversed, v.altLists.size());
         for (unsigned i = 0; i < v.wheelCount; ++i) {
             const Wheel& w = v.wheels[i];
             fprintf(f, "   wheel %u liftable=%d z=%.3f lift=%.3f offset=%.5f deflection=%.5f ground=%d\n", i, w.liftable, w.posZ,
@@ -631,12 +538,6 @@ void WriteDiagnostics()
             snprintf(d.what, sizeof(d.what), "%s lift list%s", v.name, l.first == v.axleList ? "" : " (other match)");
             nodes.push_back(d);
             fprintf(f, "  %s at %p:\n", d.what, (void*)l.first); HexDump(f, l.first - 0x30, 0x60);
-        }
-        if (v.loadArray) {
-            DiagNode d{ v.loadArray, -1, 0, 0, "" };
-            snprintf(d.what, sizeof(d.what), "%s loads", v.name);
-            nodes.push_back(d);
-            fprintf(f, "  loads at %p:\n", (void*)v.loadArray); HexDump(f, v.loadArray - 0x30, 0x60);
         }
 
         // where do the wheel telemetry values live? (exact float match near the lift list)
@@ -668,7 +569,7 @@ void WriteDiagnostics()
         for (const Vehicle& v : g_vehicles) {
             auto in = [&](const void* d, size_t bytes) { return d && a >= (uintptr_t)d && a < (uintptr_t)d + bytes; };
             if (in(v.cand.data(), v.cand.capacity() * 8) || in(v.wheelTargets.data(), v.wheelTargets.capacity() * sizeof(WheelTarget)) ||
-                in(v.loadSnap.data(), v.loadSnap.capacity()) || in(v.altLists.data(), v.altLists.capacity() * sizeof(v.altLists[0]))) return true;
+                in(v.altLists.data(), v.altLists.capacity() * sizeof(v.altLists[0]))) return true;
         }
         return false;
     };

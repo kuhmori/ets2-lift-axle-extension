@@ -3,8 +3,8 @@
 //
 // Files:
 //   dllmain.cpp   SDK entry points, telemetry, multiplayer guard, logging
-//   vehicles.cpp  axles, animation, game-key handover, automatic mode, realism
-//   memscan.cpp   finding the game's lift data and axle loads, diagnostics
+//   vehicles.cpp  axles, animation, game-key handover, automatic mode (reversing)
+//   memscan.cpp   finding the game's lift data, diagnostics
 //   input.cpp     keys, wheel/gamepad buttons, keybind capture, mouse capture for the overlay
 //   overlay.cpp   Dear ImGui overlay inside the game (DirectX 11)
 //   settings.cpp  axlelift.ini next to the DLL
@@ -166,6 +166,69 @@ SCSAPI_VOID OnMpOffset(const scs_string_t, const scs_u32_t, const scs_value_t* c
 }
 
 // ---------------------------------------------------------------------------
+// SDK input: a "semantical" device whose inputs go straight to the game's actions of the same
+// name (like Steam Input). Used to press the game's own lift-axle action: "liftaxle" (truck)
+// and "liftaxlet" (trailers). No key binding needed.
+// ---------------------------------------------------------------------------
+static const scs_input_device_input_t g_semInputs[2] = {
+    { "liftaxle", "Lift axle", SCS_VALUE_TYPE_bool },
+    { "liftaxlet", "Trailer lift axle", SCS_VALUE_TYPE_bool },
+};
+static std::atomic<bool> g_semActive{false};
+static int g_semPhase[2] = { 0, 0 };   // 0 idle, 1 send press, 2 pressed (release next frame), 3 send release
+
+bool PressGameLift(bool trailer)
+{
+    int i = trailer ? 1 : 0;
+    if (!g_semActive || g_semPhase[i] != 0) return false;
+    g_semPhase[i] = 1;
+    return true;
+}
+
+SCSAPI_VOID OnSemActive(const scs_u8_t active, const scs_context_t)
+{
+    g_semActive = active != 0;
+    if (!active) g_semPhase[0] = g_semPhase[1] = 0;
+}
+
+SCSAPI_RESULT OnSemEvent(scs_input_event_t* const ev, const scs_u32_t flags, const scs_context_t)
+{
+    if (flags & SCS_INPUT_EVENT_CALLBACK_FLAG_first_in_frame)
+        for (int& ph : g_semPhase) if (ph == 2) ph = 3;      // held for one frame: release now
+    for (int i = 0; i < 2; ++i) {
+        if (g_semPhase[i] == 1) { ev->input_index = (scs_u32_t)i; ev->value_bool.value = 1; g_semPhase[i] = 2; return SCS_RESULT_ok; }
+        if (g_semPhase[i] == 3) { ev->input_index = (scs_u32_t)i; ev->value_bool.value = 0; g_semPhase[i] = 0; return SCS_RESULT_ok; }
+    }
+    return SCS_RESULT_not_found;
+}
+
+SCSAPI_RESULT scs_input_init(const scs_u32_t version, const scs_input_init_params_t* const params)
+{
+    if (version != SCS_INPUT_VERSION_1_00) return SCS_RESULT_unsupported;
+    auto p = static_cast<const scs_input_init_params_v100_t*>(params);
+    if (strcmp(p->common.game_id, SCS_GAME_ID_EUT2) != 0) return SCS_RESULT_unsupported;
+    static scs_input_device_t dev{};   // kept alive: the game may keep referring to it
+    dev.name = "axlelift";
+    dev.display_name = "Lift Axle Extension";
+    dev.type = SCS_INPUT_DEVICE_TYPE_semantical;
+    dev.input_count = 2;
+    dev.inputs = g_semInputs;
+    dev.callback_context = nullptr;
+    dev.input_active_callback = OnSemActive;
+    dev.input_event_callback = OnSemEvent;
+    if (p->register_device(&dev) != SCS_RESULT_ok) {
+        if (p->common.log) p->common.log(SCS_LOG_TYPE_warning, "[axlelift] could not register the input device - the game's lift action can't be used");
+        return SCS_RESULT_generic_error;
+    }
+    return SCS_RESULT_ok;
+}
+
+SCSAPI_VOID scs_input_shutdown(void)
+{
+    g_semActive = false;
+}
+
+// ---------------------------------------------------------------------------
 // SDK entry points
 // ---------------------------------------------------------------------------
 SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_init_params_t* const params)
@@ -231,3 +294,5 @@ BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
 // the game looks these two up by name
 #pragma comment(linker, "/EXPORT:scs_telemetry_init")
 #pragma comment(linker, "/EXPORT:scs_telemetry_shutdown")
+#pragma comment(linker, "/EXPORT:scs_input_init")
+#pragma comment(linker, "/EXPORT:scs_input_shutdown")
