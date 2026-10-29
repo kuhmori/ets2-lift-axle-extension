@@ -3,7 +3,7 @@
 //
 // Files:
 //   dllmain.cpp   SDK entry points, telemetry, multiplayer guard, logging
-//   vehicles.cpp  axles, animation, game-key handover, automatic mode (reversing)
+//   vehicles.cpp  axles, animation, game-key handover, automatic mode (reversing), steering lock
 //   memscan.cpp   finding the game's lift data, diagnostics
 //   input.cpp     keys, wheel/gamepad buttons, keybind capture, mouse capture for the overlay
 //   overlay.cpp   Dear ImGui overlay inside the game (DirectX 11)
@@ -150,6 +150,12 @@ SCSAPI_VOID OnWheelGround(const scs_string_t, const scs_u32_t index, const scs_v
     if (v && value && index < MAX_WHEELS) v->wheels[index].onGround = value->value_bool.value != 0;
 }
 
+SCSAPI_VOID OnWheelSteering(const scs_string_t, const scs_u32_t index, const scs_value_t* const value, const scs_context_t context)
+{
+    auto* v = static_cast<Vehicle*>(context);
+    if (v && value && index < MAX_WHEELS) v->wheels[index].steering = value->value_float.value;
+}
+
 SCSAPI_VOID OnSpeed(const scs_string_t, const scs_u32_t, const scs_value_t* const value, const scs_context_t)
 {
     if (value) g_truckSpeed = value->value_float.value;
@@ -257,6 +263,7 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
         { "wheel.lift.offset", SCS_VALUE_TYPE_float, OnWheelOffset },
         { "wheel.suspension.deflection", SCS_VALUE_TYPE_float, OnWheelDeflection },
         { "wheel.on_ground", SCS_VALUE_TYPE_bool, OnWheelGround },
+        { "wheel.steering", SCS_VALUE_TYPE_float, OnWheelSteering },
     };
     for (unsigned s = 0; s < VEHICLE_COUNT; ++s) {
         for (const auto& wc : wheelChannels) {

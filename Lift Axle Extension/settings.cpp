@@ -175,6 +175,7 @@ static bool WriteIni(const char* path)
     fprintf(f, "; Keys: e.g. Alt+1, Ctrl+Shift+L, F6, Num3. Controller buttons are best set in the overlay.\n\n");
     fprintf(f, "settings_version=3\n");
     fprintf(f, "lift_seconds=%.2f\n", s.liftSeconds);
+    fprintf(f, "center_seconds=%.2f\n", s.centerSeconds);
     KeyBindText(s.overlayKey, t, sizeof(t)); fprintf(f, "overlay_key=%s\n", t);
     fprintf(f, "auto_reverse=%s\n", ReverseName(s.autoReverse));
     fprintf(f, "overlay_mouse_speed=%.2f\n", s.overlayMouseSpeed);
@@ -187,6 +188,11 @@ static bool WriteIni(const char* path)
             KeyBindText(s.axle[v][i].key, t, sizeof(t)); fprintf(f, "%s.axle%u.key=%s\n", kSlotKeys[v], i + 1, t);
             if (s.axle[v][i].joy.valid()) { JoySave(s.axle[v][i].joy, t, sizeof(t)); fprintf(f, "%s.axle%u.button=%s\n", kSlotKeys[v], i + 1, t); }
             if (s.axleAuto[v][i]) fprintf(f, "%s.axle%u.auto=1\n", kSlotKeys[v], i + 1);
+        }
+        for (unsigned i = 0; i < MAX_STEER_AXLES; ++i)
+        {
+            if (s.steerLock[v][i]) fprintf(f, "%s.steer%u.lock=1\n", kSlotKeys[v], i + 1);
+            if (s.steerLockRev[v][i]) fprintf(f, "%s.steer%u.lock_reverse=1\n", kSlotKeys[v], i + 1);
         }
     }
     fclose(f);
@@ -211,6 +217,7 @@ static bool ReadIni(const char* path)
         char slot[16];
         if (!strcmp(k, "settings_version")) (void)atoi(val);   // keys of removed features are simply ignored
         else if (!strcmp(k, "lift_seconds")) s.liftSeconds = Clampf((float)atof(val), 0.2f, 20.0f);
+        else if (!strcmp(k, "center_seconds")) s.centerSeconds = Clampf((float)atof(val), 0.1f, 10.0f);
         else if (!strcmp(k, "overlay_key")) { KeyBind b = ParseKey(val); if (b.valid()) s.overlayKey = b; }
         else if (!strcmp(k, "auto_reverse")) s.autoReverse = !_stricmp(val, "lower") ? ReverseRule::Lower : !_stricmp(val, "lift") ? ReverseRule::Lift : ReverseRule::None;
         else if (!strcmp(k, "verbose_log")) s.verboseLog = atoi(val) != 0;
@@ -226,6 +233,14 @@ static bool ReadIni(const char* path)
                 if (!strcmp(field, "key")) s.axle[v][idx - 1].key = ParseKey(val);
                 else if (!strcmp(field, "button")) s.axle[v][idx - 1].joy = ParseJoy(val);
                 else if (!strcmp(field, "auto")) s.axleAuto[v][idx - 1] = atoi(val) != 0;
+            }
+        }
+        else if (sscanf(k, "%15[a-z0-9].steer%u", slot, &idx) == 2 && idx >= 1 && idx <= MAX_STEER_AXLES) {
+            const char* field = strrchr(k, '.') + 1;
+            for (unsigned v = 0; v < VEHICLE_COUNT; ++v) {
+                if (strcmp(slot, kSlotKeys[v]) != 0) continue;
+                if (!strcmp(field, "lock")) s.steerLock[v][idx - 1] = atoi(val) != 0;
+                else if (!strcmp(field, "lock_reverse")) s.steerLockRev[v][idx - 1] = atoi(val) != 0;
             }
         }
     }

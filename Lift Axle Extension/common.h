@@ -32,13 +32,14 @@
 #include "common/scssdk_telemetry_truck_common_channels.h"
 #include "common/scssdk_telemetry_trailer_common_channels.h"
 
-#define AXLELIFT_VERSION "1.0.0-beta5"
+#define AXLELIFT_VERSION "1.0.0-beta6"
 
 // ---------------------------------------------------------------------------
 // limits
 // ---------------------------------------------------------------------------
 static const unsigned MAX_WHEELS = 16;
 static const unsigned MAX_LIFT_AXLES = 8;     // per vehicle
+static const unsigned MAX_STEER_AXLES = 8;    // per vehicle
 static const unsigned MAX_TRAILERS = 10;      // SDK reports trailer.0 .. trailer.9
 static const unsigned VEHICLE_COUNT = 1 + MAX_TRAILERS; // slot 0 = truck, 1.. = trailer.0 ..
 
@@ -87,6 +88,7 @@ enum class ReverseRule : int { None = 0, Lower = 1, Lift = 2 };
 
 struct Settings {
     float liftSeconds = 2.0f;
+    float centerSeconds = 1.0f;      // steering lock: time to bring the wheels straight
     KeyBind overlayKey{ 'O', false, true, false };
     ReverseRule autoReverse = ReverseRule::None;   // automatic mode: what axles with "Auto" do when reversing
 
@@ -97,6 +99,8 @@ struct Settings {
     ActionBind releaseAll;
     ActionBind axle[VEHICLE_COUNT][MAX_LIFT_AXLES];
     bool axleAuto[VEHICLE_COUNT][MAX_LIFT_AXLES] = {};
+    bool steerLock[VEHICLE_COUNT][MAX_STEER_AXLES] = {};      // hold this steered axle straight all the time
+    bool steerLockRev[VEHICLE_COUNT][MAX_STEER_AXLES] = {};   // ...only while reversing
 };
 
 extern Settings g_settings;           // owned by the game thread; the overlay gets copies
@@ -117,7 +121,25 @@ struct Wheel {
     float deflection = 0.0f;  // telemetry: suspension deflection (m)
     bool  onGround = true;    // telemetry
     int liftAxle = -1;        // index into Vehicle::axles, -1 = not liftable
+    bool steerable = false;   // configuration
+    float steering = 0.0f;    // telemetry: steering angle in rotations (+ = left)
+    int steerAxle = -1;       // index into Vehicle::steerAxles, -1 = not lockable
 };
+
+// a steered axle the player can lock straight while reversing
+struct SteerAxle {
+    std::vector<unsigned> wheels;
+    unsigned allIndex = 0;
+    bool locking = false;         // we write its steering (locked, centering or releasing)
+    bool holding = false;         // lock wanted right now (false while easing back to the game)
+    float blend = 1.0f;           // 1 = the game's own angle .. 0 = straight
+    double straightSince = 0.0;   // centering finished at
+    bool noEffectWarned = false;  // game kept steering it although we wrote 0
+};
+
+// a place in memory that holds the steering angle of one steered axle
+// unit: 0 = rotations, 1 = -rotations, 2 = radians, 3 = -radians
+struct SteerTarget { uintptr_t addr; uint8_t axle; uint8_t unit; uint16_t miss; float game; float written; };
 
 struct Axle {
     std::vector<unsigned> wheels;
@@ -161,6 +183,14 @@ struct Vehicle {
     uintptr_t axleList = 0;       // one float per axle: lift position
     bool listReversed = false;    // axle list is rear-to-front
     std::vector<WheelTarget> wheelTargets;
+
+    // steering lock (memscan.cpp finds, vehicles.cpp writes)
+    std::vector<SteerAxle> steerAxles;   // lockable steered axles, front to back
+    std::vector<SteerTarget> steerCand;  // search / found steering values
+    bool steerArmed = false, steerScanDone = false, steerFound = false;
+    unsigned steerRefines = 0;
+    float steerLast[MAX_WHEELS] = {};    // telemetry at the last refine
+    double steerUnlockedAt = 0.0;        // last time a lock ended (memory needs a moment to follow the game again)
 };
 
 extern Vehicle g_vehicles[VEHICLE_COUNT];
@@ -182,6 +212,8 @@ bool CanSwapWithNext(unsigned slot);
 void UpdateAxles(float dt);           // animation, game-key detection, automatic mode, writing
 float AxleUiPos(const Vehicle& v, const Axle& a);
 bool  AxleUiUp(const Vehicle& v, const Axle& a);
+void UpdateSteering(float dt);        // steering lock (called from UpdateAxles)
+bool SteerAxleLifted(const Vehicle& v, const SteerAxle& a);
 
 // ---------------------------------------------------------------------------
 // memory (memscan.cpp)
@@ -193,6 +225,9 @@ void RescanVehicle(unsigned slot);
 void DataLost(unsigned slot);         // our memory no longer drives this vehicle: set up again
 void ResetTargets(Vehicle& v);
 bool ProbeActive();                   // telling identical trailers apart right now
+void ResetSteer(Vehicle& v);          // forget the steering memory (layout changed / data lost)
+float SteerExpected(unsigned unit, float rotations);
+bool  SteerMatches(const Vehicle& v, const SteerTarget& t, float value);
 void WriteDiagnostics();              // research export (debug section)
 bool CheckGameVersion(char* versionOut, size_t n);
 
@@ -229,7 +264,7 @@ void OverlayShutdown();
 void OverlayPublish();                // game thread: copy state for the UI
 
 // commands from the UI (render thread) to the game thread
-enum class CmdType { ToggleAxle, ReleaseVehicle, ReleaseAll, Rescan, SetAuto, BindCapture, ClearBind,
+enum class CmdType { ToggleAxle, ReleaseVehicle, ReleaseAll, Rescan, SetAuto, SetSteerLock, BindCapture, ClearBind,
                      ApplySettings, Diagnostics, SwapTrailers, CloseOverlay };
 struct Command {
     CmdType type;

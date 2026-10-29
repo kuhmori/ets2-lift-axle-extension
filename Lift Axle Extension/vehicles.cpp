@@ -44,12 +44,15 @@ void OnVehicleConfig(const char* id, const scs_named_value_t* attributes)
             wheels[a->index].liftable = a->value.value_bool.value != 0;
         else if (!strcmp(a->name, SCS_TELEMETRY_CONFIG_ATTRIBUTE_wheel_position) && a->index < MAX_WHEELS)
             wheels[a->index].posZ = a->value.value_fvector.z;
+        else if (!strcmp(a->name, SCS_TELEMETRY_CONFIG_ATTRIBUTE_wheel_steerable) && a->index < MAX_WHEELS)
+            wheels[a->index].steerable = a->value.value_bool.value != 0;
     }
 
     // the game re-sends configurations for unrelated reasons: keep everything if the layout is unchanged
     bool same = v.present && count == v.wheelCount;
     for (unsigned i = 0; same && i < count; ++i)
-        same = wheels[i].liftable == v.wheels[i].liftable && std::fabs(wheels[i].posZ - v.wheels[i].posZ) < 0.01f;
+        same = wheels[i].liftable == v.wheels[i].liftable && wheels[i].steerable == v.wheels[i].steerable &&
+               std::fabs(wheels[i].posZ - v.wheels[i].posZ) < 0.01f;
     if (same) {
         // same layout, but the game may have rebuilt the vehicle (e.g. loading cargo) -> check it
         if (v.found) { v.verifyNeeded = true; LogDebug("[axlelift] %s re-sent by the game - checking the lift data", v.name); }
@@ -57,8 +60,10 @@ void OnVehicleConfig(const char* id, const scs_named_value_t* attributes)
     }
 
     ResetTargets(v);
+    ResetSteer(v);
     v.axles.clear();
     v.axleZ.clear();
+    v.steerAxles.clear();
     for (unsigned i = 0; i < MAX_WHEELS; ++i) { v.wheels[i] = Wheel{}; if (i < count) v.wheels[i] = wheels[i]; }
     v.wheelCount = count;
     v.present = count > 0;
@@ -87,7 +92,22 @@ void OnVehicleConfig(const char* id, const scs_named_value_t* attributes)
         v.scanArmed = true;   // finished automatically the first time the axles move with the game key
         v.lastL = -1.0f;
     }
-    LogInfo("[axlelift] %s: %u wheels, %u axles, %u liftable", v.name, count, (unsigned)v.axleZ.size(), (unsigned)v.axles.size());
+
+    // steered axles that can be locked. Truck: all except the front axle the driver steers
+    // (pusher / tag axles). Trailers: all of them.
+    for (unsigned k = 0; k < v.axleZ.size(); ++k) {
+        SteerAxle sa;
+        for (unsigned i = 0; i < count; ++i)
+            if (v.wheels[i].steerable && std::fabs(v.wheels[i].posZ - v.axleZ[k]) <= 0.2f) sa.wheels.push_back(i);
+        if (sa.wheels.empty() || (slot == 0 && k == 0) || v.steerAxles.size() >= MAX_STEER_AXLES) continue;
+        sa.allIndex = k;
+        for (unsigned w : sa.wheels) v.wheels[w].steerAxle = (int)v.steerAxles.size();
+        v.steerAxles.push_back(sa);
+    }
+    v.steerArmed = !v.steerAxles.empty();   // found the first time these axles steer (drive through a turn)
+
+    LogInfo("[axlelift] %s: %u wheels, %u axles, %u liftable, %u steered (lockable)", v.name, count, (unsigned)v.axleZ.size(),
+            (unsigned)v.axles.size(), (unsigned)v.steerAxles.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +298,7 @@ void UpdateAxles(float dt)
 {
     double now = NowSeconds();
     float step = dt / std::max(g_settings.liftSeconds, 0.05f);
+    UpdateSteering(dt);
 
     for (unsigned s = 0; s < VEHICLE_COUNT; ++s) {
         Vehicle& v = g_vehicles[s];
@@ -335,6 +356,77 @@ void UpdateAxles(float dt)
                 a.controlled = false;
                 a.releasing = false;
             }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// steering lock: while reversing, hold the chosen steered axles straight by writing 0 into the
+// steering values found in memory (see SteerScanTick). Runs at frame start and frame end like
+// the lift writes. If the game keeps steering the axle anyway, the player is told once.
+// ---------------------------------------------------------------------------
+bool SteerAxleLifted(const Vehicle& v, const SteerAxle& a)
+{
+    for (unsigned w : a.wheels) if (v.wheels[w].liftable && (v.wheels[w].liftOffset > 0.05f || v.wheels[w].gameLift > 0.5f)) return true;
+    return false;
+}
+
+void UpdateSteering(float dt)
+{
+    double now = NowSeconds();
+    bool reversing = g_truckGear < 0;
+    float step = dt / std::max(g_settings.centerSeconds, 0.05f);
+    for (unsigned s = 0; s < VEHICLE_COUNT; ++s) {
+        Vehicle& v = g_vehicles[s];
+        if (!v.present) continue;
+        bool anyLock = false;
+        for (unsigned i = 0; i < v.steerAxles.size(); ++i) {
+            SteerAxle& a = v.steerAxles[i];
+            bool wanted = g_settings.steerLock[s][i] || (g_settings.steerLockRev[s][i] && reversing);
+            // a lifted steered axle is already held straight by the game
+            bool want = wanted && v.steerFound && !g_blocked && !SteerAxleLifted(v, a);
+            if (want && !a.locking) {
+                // start centering smoothly from where the wheels are now
+                a.locking = true; a.blend = 1.0f; a.straightSince = 0.0; a.noEffectWarned = false;
+                for (SteerTarget& t : v.steerCand) if (t.axle == i) t.written = NAN;
+                LogDebug("[axlelift] %s steered axle %u locked (%s)", v.name, i + 1, g_settings.steerLock[s][i] ? "always" : "reversing");
+            }
+            if (!a.locking) continue;
+            if (g_blocked) { a.locking = a.holding = false; a.blend = 1.0f; continue; }   // multiplayer: never write, not even to ease out
+            a.holding = want;
+
+            // the game's own angle: whatever is in memory that we didn't put there (it keeps
+            // computing it - at frame end we see its fresh value, at frame start our own write)
+            for (SteerTarget& t : v.steerCand) {
+                if (t.axle != i) continue;
+                float f;
+                if (ReadMem(t.addr, &f, 4) && std::isfinite(f) && !(std::fabs(f - t.written) < 1e-6f)) t.game = f;
+            }
+            // ease towards straight while locked, back to the game's angle when released
+            a.blend = want ? std::max(0.0f, a.blend - step) : std::min(1.0f, a.blend + step);
+            if (!want && a.blend >= 1.0f) {
+                a.locking = false; v.steerUnlockedAt = now;
+                LogDebug("[axlelift] %s steered axle %u free again", v.name, i + 1);
+                continue;
+            }
+            anyLock = true;
+            if (!want || a.blend > 0.0f) a.straightSince = 0.0;
+            else if (a.straightSince == 0.0) a.straightSince = now;
+            // smoothstep: soft start and soft end
+            float k = a.blend * a.blend * (3.0f - 2.0f * a.blend);
+            for (SteerTarget& t : v.steerCand)
+                if (t.axle == i) { t.written = t.game * k; WriteFloat(t.addr, t.written); }
+
+            // does it work? the game reports the real wheel angle in telemetry
+            float worst = 0.0f;
+            for (unsigned w : a.wheels) worst = std::max(worst, std::fabs(v.wheels[w].steering));
+            if (want && !a.noEffectWarned && a.straightSince > 0.0 && now - a.straightSince > 1.0 && worst > 0.01f) {
+                a.noEffectWarned = true;
+                Notify("%s steered axle %u: lock has no effect - the game keeps steering it (%.1f deg)", v.name, i + 1, worst * 360.0f);
+                for (const SteerTarget& t : v.steerCand)
+                    if (t.axle == i) LogInfo("[axlelift]   steering target %p unit %u", (void*)t.addr, t.unit);
+            }
+        }
+        if (anyLock) v.steerUnlockedAt = now;
     }
 }
 

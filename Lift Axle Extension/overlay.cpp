@@ -13,11 +13,15 @@
 // state shared between the game thread (publishes) and the render thread (draws)
 // ---------------------------------------------------------------------------
 struct UiAxle { float pos = 0; bool up = false, controlled = false, releasing = false; };
+struct UiSteer { float angle = 0; bool locking = false, releasing = false, lifted = false; };
 struct UiVehicle {
     bool present = false, found = false, scanning = false, uncertain = false, canSwap = false, notRecognised = false, probing = false;
     char name[24] = "";
     unsigned axleCount = 0, allCount = 0, wheelObjects = 0;
     UiAxle axles[MAX_LIFT_AXLES];
+    unsigned steerCount = 0;
+    bool steerFound = false, steerSearching = false;
+    UiSteer steer[MAX_STEER_AXLES];
     uintptr_t list = 0;
     int allIndex[MAX_LIFT_AXLES] = {};
 };
@@ -64,7 +68,7 @@ void OverlayPublish()
     for (unsigned s = 0; s < VEHICLE_COUNT; ++s) {
         const Vehicle& v = g_vehicles[s];
         UiVehicle& u = st->v[s];
-        u.present = v.present && !v.axles.empty();
+        u.present = v.present && (!v.axles.empty() || !v.steerAxles.empty());
         if (!u.present) continue;
         snprintf(u.name, sizeof(u.name), "%s", v.name);
         u.found = v.found;
@@ -85,6 +89,18 @@ void OverlayPublish()
             u.axles[i].releasing = a.releasing;
             u.allIndex[i] = (int)a.allIndex;
         }
+        u.steerCount = (unsigned)v.steerAxles.size();
+        u.steerFound = v.steerFound;
+        u.steerSearching = v.steerScanDone && !v.steerFound;
+        for (unsigned i = 0; i < u.steerCount; ++i) {
+            const SteerAxle& a = v.steerAxles[i];
+            float ang = 0.0f;
+            for (unsigned w : a.wheels) if (std::fabs(v.wheels[w].steering) > std::fabs(ang)) ang = v.wheels[w].steering;
+            u.steer[i].angle = ang * 360.0f;
+            u.steer[i].locking = a.locking;
+            u.steer[i].releasing = a.locking && !a.holding;
+            u.steer[i].lifted = SteerAxleLifted(v, a);
+        }
     }
     std::lock_guard<std::mutex> lock(g_uiMutex);
     g_ui = *st;
@@ -103,15 +119,26 @@ void RunCommands()
         case CmdType::ToggleAxle: ToggleAxle(c.slot, c.axle); break;
         case CmdType::ReleaseVehicle: ReleaseVehicle(c.slot); break;
         case CmdType::ReleaseAll: ReleaseAll(); break;
-        case CmdType::Rescan: RescanVehicle(c.slot); Notify("%s: lift or lower the axles once with the game key", g_vehicles[c.slot].name); break;
+        case CmdType::Rescan:
+            if (c.slot >= VEHICLE_COUNT) break;
+            RescanVehicle(c.slot); ResetSteer(g_vehicles[c.slot]);
+            Notify("%s: lift or lower the axles once with the game key (and drive through a turn for the steering lock)", g_vehicles[c.slot].name);
+            break;
         case CmdType::SetAuto:
             if (c.slot < VEHICLE_COUNT && c.axle < MAX_LIFT_AXLES) { g_settings.axleAuto[c.slot][c.axle] = c.value != 0; SaveSettings(); }
+            break;
+        case CmdType::SetSteerLock:   // value: bit 0 = lock, bit 1 = lock when reversing
+            if (c.slot < VEHICLE_COUNT && c.axle < MAX_STEER_AXLES) {
+                g_settings.steerLock[c.slot][c.axle] = (c.value & 1) != 0;
+                g_settings.steerLockRev[c.slot][c.axle] = (c.value & 2) != 0;
+                SaveSettings();
+            }
             break;
         case CmdType::BindCapture: BeginBindCapture(c.value); break;
         case CmdType::ClearBind: ClearBind(c.value); break;
         case CmdType::ApplySettings: {
             Settings& s = g_settings; const Settings& n = c.settings;
-            s.liftSeconds = n.liftSeconds; s.overlayMouseSpeed = n.overlayMouseSpeed;
+            s.liftSeconds = n.liftSeconds; s.overlayMouseSpeed = n.overlayMouseSpeed; s.centerSeconds = n.centerSeconds;
             s.autoReverse = n.autoReverse; s.verboseLog = n.verboseLog; s.showDebug = n.showDebug;
             SaveSettings();
             break;
@@ -215,7 +242,7 @@ static void DrawVehicle(const UiState& st, unsigned slot)
     ImGui::PushID((int)slot);
     if (!ImGui::CollapsingHeader(u.name, ImGuiTreeNodeFlags_DefaultOpen)) { ImGui::PopID(); return; }
 
-    if (!u.found) {
+    if (u.axleCount && !u.found) {
         if (u.notRecognised)
             ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Lift data not recognised (game %s). This game version may not be supported yet.", st.version);
         else
@@ -228,7 +255,7 @@ static void DrawVehicle(const UiState& st, unsigned slot)
         if (ImGui::SmallButton("Swap with next trailer")) Cmd(CmdType::SwapTrailers, slot);
     }
 
-    if (ImGui::BeginTable("axles", 5, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+    if (u.axleCount && ImGui::BeginTable("axles", 5, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
         ImGui::TableSetupColumn("Axle", ImGuiTableColumnFlags_WidthFixed, 120);
         ImGui::TableSetupColumn("Position", ImGuiTableColumnFlags_WidthFixed, 120);
         ImGui::TableSetupColumn("Auto", ImGuiTableColumnFlags_WidthFixed, 40);
@@ -269,9 +296,49 @@ static void DrawVehicle(const UiState& st, unsigned slot)
         }
         ImGui::EndTable();
     }
-    ImGui::BeginDisabled(!u.found || st.blocked);
-    if (ImGui::Button("Release to game")) Cmd(CmdType::ReleaseVehicle, slot);
-    ImGui::EndDisabled();
+    if (u.axleCount) {
+        ImGui::BeginDisabled(!u.found || st.blocked);
+        if (ImGui::Button("Release to game")) Cmd(CmdType::ReleaseVehicle, slot);
+        ImGui::EndDisabled();
+    }
+
+    // steered axles: lock straight while reversing
+    if (u.steerCount) {
+        if (!u.steerFound)
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", u.steerSearching ? "Steering lock setup: keep driving through a few turns..."
+                                                                                : "Steering lock setup: drive through a turn once (the steered axles have to move).");
+        if (ImGui::BeginTable("steer", 4, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+            ImGui::TableSetupColumn("Steered axle", ImGuiTableColumnFlags_WidthFixed, 120);
+            ImGui::TableSetupColumn("Steering", ImGuiTableColumnFlags_WidthFixed, 120);
+            ImGui::TableSetupColumn("Lock", ImGuiTableColumnFlags_WidthFixed, 40);
+            ImGui::TableSetupColumn("Reverse", ImGuiTableColumnFlags_WidthFixed, 60);
+            ImGui::TableHeadersRow();
+            for (unsigned i = 0; i < u.steerCount; ++i) {
+                const UiSteer& a = u.steer[i];
+                ImGui::PushID(100 + (int)i);
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::Text("Steered axle %u%s", i + 1, u.steerCount > 1 && i == 0 ? " (front)" : u.steerCount > 1 && i == u.steerCount - 1 ? " (rear)" : "");
+                ImGui::TableNextColumn();
+                if (a.releasing) ImGui::Text("releasing %+.1f deg", a.angle);
+                else if (a.locking) ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), std::fabs(a.angle) > 0.3f ? "centering %+.1f deg" : "LOCKED %+.1f deg", a.angle);
+                else if (a.lifted) ImGui::TextDisabled("lifted - held straight");
+                else ImGui::Text("free %+.1f deg", a.angle);
+                ImGui::TableNextColumn();
+                bool lock = s.steerLock[slot][i], rev = s.steerLockRev[slot][i];
+                if (ImGui::Checkbox("##lock", &lock)) Cmd(CmdType::SetSteerLock, slot, i, (lock ? 1 : 0) | (rev ? 2 : 0));
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Lock this axle straight all the time.");
+                ImGui::TableNextColumn();
+                ImGui::BeginDisabled(lock);
+                if (ImGui::Checkbox("##rev", &rev)) Cmd(CmdType::SetSteerLock, slot, i, (lock ? 1 : 0) | (rev ? 2 : 0));
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("Lock this axle only while reversing: the wheels are centered smoothly\nand steer freely again when you drive forward.");
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
     ImGui::Spacing();
     ImGui::PopID();
 }
@@ -288,6 +355,7 @@ static void DrawSettings(const UiState& st)
     KeyBindText(s.overlayKey, t, sizeof(t));
     ImGui::Text("Overlay key"); ImGui::SameLine(160); BindButton(t, BIND_OVERLAY, st.capture, 120);
     changed |= ImGui::SliderFloat("Overlay mouse speed", &s.overlayMouseSpeed, 0.25f, 4.0f, "%.2f");
+    changed |= ImGui::SliderFloat("Steering centering time", &s.centerSeconds, 0.2f, 5.0f, "%.1f s");
 
     ImGui::SeparatorText("Automatic mode (axles with 'Auto' ticked)");
     int rev = (int)s.autoReverse;
@@ -312,8 +380,8 @@ static void DrawDebug(const UiState& st)
         const UiVehicle& u = st.v[s];
         if (!u.present) continue;
         ImGui::PushID((int)s);
-        ImGui::Text("%s: %s, lift data %p, wheel objects %u", u.name, u.found ? "found" : u.scanning ? "searching" : "-",
-                    (void*)u.list, u.wheelObjects);
+        ImGui::Text("%s: %s, lift data %p, wheel objects %u, steering %s", u.name, u.found ? "found" : u.scanning ? "searching" : "-",
+                    (void*)u.list, u.wheelObjects, u.steerFound ? "found" : u.steerSearching ? "searching" : "-");
         ImGui::SameLine();
         if (ImGui::SmallButton("Search again")) Cmd(CmdType::Rescan, s);
         ImGui::PopID();
@@ -349,7 +417,7 @@ static void DrawUi()
 
     bool any = false;
     for (unsigned v = 0; v < VEHICLE_COUNT; ++v) if (st.v[v].present) { DrawVehicle(st, v); any = true; }
-    if (!any) ImGui::TextDisabled("No truck or trailer with lift axles right now.");
+    if (!any) ImGui::TextDisabled("No truck or trailer with lift or steered axles right now.");
 
     ImGui::Separator();
     ImGui::BeginDisabled(st.blocked);

@@ -2,11 +2,11 @@
 
 Lift every lift axle of your truck and trailers **on its own** – not just all of them at once.
 Control them from an in-game overlay, with keyboard shortcuts or with buttons on your wheel / gamepad.
-Optional automatic mode lifts or lowers chosen axles while reversing.
+Optional automatic mode lifts or lowers chosen axles while reversing, and steered axles can be locked straight – always or only while reversing.
 
 > **Single-player only.** The plugin switches itself off in TruckersMP and in Convoy sessions.
 
-> **Status:** beta (1.0.0-beta5, see [CHANGELOG](CHANGELOG.md)). Tested with ETS2 **1.61.1.9** on Windows 11, DirectX 11 renderer.
+> **Status:** beta (1.0.0-beta6, see [CHANGELOG](CHANGELOG.md)). Tested with ETS2 **1.61.1.9** on Windows 11, DirectX 11 renderer.
 
 ---
 
@@ -18,6 +18,7 @@ Optional automatic mode lifts or lowers chosen axles while reversing.
 - **Keybinds** – a keyboard shortcut and a wheel / gamepad button for every axle and for "release all", set in the overlay
 - **Steerable lift axles** – work normally; the plugin uses the game's own lift action where it can, so steering isn't locked
 - **Automatic mode** (optional, per axle) – lift or lower the axle while reversing, back to the previous state when driving forward
+- **Steering lock** (per steered axle) – hold self-steering / steered axles straight, either all the time (*Lock*) or only while reversing (*Reverse*). The wheels are centered smoothly and ease back to the game's steering when released. Works for trailers and for the truck's steered pusher / tag axles (not the front axle you steer with)
 - **Release to game** – axles glide back to the game's own state and the game takes over again
 - **Identical trailers** (e.g. B-doubles) are told apart automatically
 - **No fixed memory addresses** – the plugin recognises the game's lift data by its behaviour every time. If a game update changes it, the plugin says "not recognised" and does nothing instead of writing to the wrong place
@@ -40,6 +41,7 @@ Optional automatic mode lifts or lowers chosen axles while reversing.
 2. **Lift or lower the axles once with the game's own lift key.**
    While they move, the plugin finds the lift data in the game's memory. The game pauses for about **3 seconds** once – this happens once per trailer after coupling.
 3. Press **`Alt+O`** – the overlay opens. Click an axle to lift or lower it.
+4. **Steering lock:** drive through a turn or two once, so the steered axles move. The plugin finds their steering data while they steer (the game may pause for a moment, once per trailer) and shows *"steering lock ready"*. Then tick *Lock* or *Reverse* next to a steered axle in the overlay.
 
 ## Controls
 
@@ -62,12 +64,15 @@ Everything is set in the overlay (*Settings*) and saved in `axlelift.ini` next t
 | Lift / lower time | 2.0 s | |
 | Overlay mouse speed | 1.0 | |
 | Automatic mode: when reversing | no change | or always lower / always lift |
+| Steering centering time | 1.0 s | how long locking / releasing a steered axle takes |
 
 Automatic mode is switched on per axle with the *Auto* checkbox in the overlay.
+The steering lock is set per steered axle with the *Lock* and *Reverse* checkboxes.
 
 ## Known limitations
 
 - **Game's own lift key after using the plugin:** the game remembers its own lift state and doesn't know what the plugin changed. Pressing the game's key may then only cause a short bounce. Click **Release to game** (or `Alt+0`) first – after that the game's key works normally again.
+- **Lifted steered axles** are already held straight by the game, so the steering lock leaves them alone while they are up.
 - **First lift needed** after coupling a trailer (see *First use*) and again after loading cargo, because the game rebuilds the trailer. The overlay tells you when.
 - **DirectX 11 only** for the overlay (the game's default renderer). Keys work regardless.
 - **ETS2 only** for now – American Truck Simulator is not supported yet.
@@ -95,6 +100,7 @@ Everything needed is in this repository (SCS SDK headers, Dear ImGui, MinHook).
 - The game's telemetry SDK reports each wheel's lift state and the vehicle layout.
 - When the axles move with the game's key, the plugin searches the game's memory for values that follow exactly the same movement and recognises the per-axle lift list that drives the physics. Nothing is hard-coded.
 - The plugin then writes its own lift positions into that list. When a change matches what the game's own lift key would do, it presses that key through the SDK input API instead, so the game keeps its own state (steering of steerable axles) in sync.
+- Steering lock: the SDK reports each wheel's steering angle. While the steered axles turn, the plugin searches memory for values that follow that angle exactly, then eases them to straight (and back) while a lock is active. If the game keeps steering anyway, the overlay says so instead of failing silently.
 - The overlay is drawn with Dear ImGui inside the game's DirectX 11 frame; mouse input is taken from the game's DirectInput mouse while the overlay is open.
 
 ## Credits & licences

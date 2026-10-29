@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.0-beta6
+
+### Added
+- Steering lock for steered axles. Every steered trailer axle, and the truck's steered pusher / tag axles, get two checkboxes in the overlay: *Lock* holds the axle straight all the time, *Reverse* holds it straight only while reversing and lets it steer again when you drive forward.
+- Locking centers the wheels smoothly, and releasing eases them back to the game's own steering angle. The time is set with *Steering centering time* in the settings (default 1 s).
+- The plugin finds the steering data by itself the first time the steered axles move (drive through a turn). If the game keeps steering an axle despite the lock, the overlay tells you.
+- Diagnostics file now includes the steering data.
+
 ## 1.0.0-beta5
 
 ### Fixed

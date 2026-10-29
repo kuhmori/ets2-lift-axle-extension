@@ -1,4 +1,4 @@
-// memory: find each vehicle's lift data, tell identical trailers apart, game version, research export
+// memory: find each vehicle's lift data and steering values, tell identical trailers apart, game version, research export
 //
 // Layout found on ETS2 1.61.1.9 (checked structurally at run time, never trusted blindly):
 //   axle list    one float per axle (0 = down, 1 = up), front to back; drives the physics
@@ -412,12 +412,197 @@ static void ProbeTick()
 }
 
 // ---------------------------------------------------------------------------
+// steering: find where each lockable steered axle keeps its steering angle.
+// Telemetry tells us the angle (rotations); memory may hold it as rotations or radians, either
+// sign. First search: every float matching a steered wheel's angle. Then follow the angle while
+// the axle steers; only values that track it through several different angles are kept.
+// ---------------------------------------------------------------------------
+static const size_t MAX_STEER_CANDIDATES = 4000000;
+static const float  TWO_PI = 6.28318531f;
+
+float SteerExpected(unsigned unit, float rot)
+{
+    float v = unit >= 2 ? rot * TWO_PI : rot;
+    return (unit & 1) ? -v : v;
+}
+static float SteerTol(unsigned unit) { return unit >= 2 ? 1.2e-4f : 2.0e-5f; }
+
+// does this memory value match the current angle of the target's axle (any of its wheels)?
+bool SteerMatches(const Vehicle& v, const SteerTarget& t, float value)
+{
+    if (t.axle >= v.steerAxles.size()) return false;
+    for (unsigned w : v.steerAxles[t.axle].wheels)
+        if (std::fabs(value - SteerExpected(t.unit, v.wheels[w].steering)) < SteerTol(t.unit)) return true;
+    return false;
+}
+
+void ResetSteer(Vehicle& v)
+{
+    Wipe(v.steerCand);
+    v.steerArmed = !v.steerAxles.empty();
+    v.steerScanDone = v.steerFound = false;
+    v.steerRefines = 0;
+    for (auto& a : v.steerAxles) { a.locking = a.holding = false; a.blend = 1.0f; a.noEffectWarned = false; }
+}
+
+static bool SteerFirstScan(Vehicle& v)
+{
+    struct T { float val, tol; uint8_t axle, unit; };
+    std::vector<T> targets;
+    for (unsigned i = 0; i < v.steerAxles.size(); ++i)
+        for (unsigned w : v.steerAxles[i].wheels) {
+            float rot = v.wheels[w].steering;
+            if (std::fabs(rot) < 0.005f) continue;
+            for (uint8_t u = 0; u < 4; ++u) targets.push_back({ SteerExpected(u, rot), SteerTol(u), (uint8_t)i, u });
+        }
+    if (targets.empty()) return false;
+    std::sort(targets.begin(), targets.end(), [](const T& a, const T& b) { return a.val < b.val; });
+    const float maxTol = SteerTol(2);
+    // quick reject: every target lies in a narrow band of absolute values
+    float absLo = 1e9f, absHi = 0.0f;
+    for (const T& t : targets) { absLo = std::min(absLo, std::fabs(t.val) - maxTol); absHi = std::max(absHi, std::fabs(t.val) + maxTol); }
+    uint32_t bitsLo, bitsHi;
+    { float lo = std::max(absLo, 1e-6f); memcpy(&bitsLo, &lo, 4); memcpy(&bitsHi, &absHi, 4); }
+
+    Wipe(v.steerCand);
+    std::vector<uint8_t> buf(1 << 20);
+    bool overflow = false;
+    ForEachResidentRun([&](uintptr_t addr, size_t n) {
+        if (n > buf.size()) buf.resize(n);
+        if (!ReadMem(addr, buf.data(), n)) return true;
+        for (size_t off = 0; off + 4 <= n; off += 4) {
+            uint32_t bits; memcpy(&bits, &buf[off], 4);
+            bits &= 0x7FFFFFFFu;                                   // |f| as bits: integer compare, no float math
+            if (bits < bitsLo || bits > bitsHi) continue;
+            float f; memcpy(&f, &buf[off], 4);
+            auto it = std::lower_bound(targets.begin(), targets.end(), f - maxTol, [](const T& t, float x) { return t.val < x; });
+            for (; it != targets.end() && it->val <= f + maxTol; ++it) {
+                if (std::fabs(f - it->val) >= it->tol) continue;
+                v.steerCand.push_back({ addr + off, it->axle, it->unit, 0, 0.0f, 0.0f });
+                break;
+            }
+            if (v.steerCand.size() >= MAX_STEER_CANDIDATES) { overflow = true; return false; }
+        }
+        return true;
+    });
+    Wipe(buf);
+    if (overflow) Wipe(v.steerCand);
+    return !overflow;
+}
+
+// keep candidates that still match; a value may move to another axle of the same vehicle
+static void SteerRefine(Vehicle& v)
+{
+    std::vector<SteerTarget> keep;
+    keep.reserve(v.steerCand.size() / 4 + 16);
+    uint8_t page[4096];
+    uintptr_t cur = 0; bool ok = false;
+    for (SteerTarget t : v.steerCand) {
+        uintptr_t pg = t.addr & ~(uintptr_t)0xFFF;
+        if (pg != cur || !cur) { cur = pg; ok = ReadMem(pg, page, sizeof(page)); }
+        if (!ok) continue;
+        float f; memcpy(&f, &page[t.addr - pg], 4);
+        if (SteerMatches(v, t, f)) { keep.push_back(t); continue; }
+        for (uint8_t a = 0; a < v.steerAxles.size(); ++a) {
+            SteerTarget o = t; o.axle = a;
+            if (a != t.axle && SteerMatches(v, o, f)) { keep.push_back(o); break; }
+        }
+    }
+    v.steerCand.swap(keep);
+    v.steerCand.shrink_to_fit();
+    Wipe(keep);
+}
+
+static void SteerScanTick(bool& scannedThisFrame)
+{
+    double now = NowSeconds();
+    for (Vehicle& v : g_vehicles) {
+        if (!v.present || v.steerAxles.empty()) continue;
+
+        float moved = 0.0f, biggest = 0.0f;
+        for (auto& a : v.steerAxles)
+            for (unsigned w : a.wheels) {
+                moved = std::max(moved, std::fabs(v.wheels[w].steering - v.steerLast[w]));
+                biggest = std::max(biggest, std::fabs(v.wheels[w].steering));
+            }
+        auto remember = [&]() { for (unsigned w = 0; w < v.wheelCount; ++w) v.steerLast[w] = v.wheels[w].steering; };
+
+        if (v.steerFound) {
+            // still the right memory? (not while we write it ourselves, nor right after)
+            bool locking = false;
+            for (auto& a : v.steerAxles) locking |= a.locking;
+            if (locking || now - v.steerUnlockedAt < 0.5) continue;
+            for (size_t i = 0; i < v.steerCand.size();) {
+                SteerTarget& t = v.steerCand[i];
+                float f;
+                if (ReadMem(t.addr, &f, 4) && SteerMatches(v, t, f)) t.miss = 0;
+                else if (++t.miss > 60) { v.steerCand.erase(v.steerCand.begin() + i); continue; }
+                ++i;
+            }
+            bool covered = true;
+            for (uint8_t a = 0; a < v.steerAxles.size(); ++a) {
+                bool any = false;
+                for (auto& t : v.steerCand) any |= t.axle == a;
+                covered &= any;
+            }
+            if (!covered) {
+                Log(SCS_LOG_TYPE_warning, "[axlelift] %s: steering memory no longer valid - searching again", v.name);
+                ResetSteer(v);
+                remember();
+            }
+            continue;
+        }
+
+        if (v.steerArmed && !v.steerScanDone && biggest > 0.01f && !scannedThisFrame) {
+            double t0 = NowSeconds();
+            scannedThisFrame = true;
+            v.steerArmed = false;
+            if (!SteerFirstScan(v)) { LogDebug("[axlelift] %s: steering search - too many matches, trying again", v.name); v.steerArmed = true; continue; }
+            v.steerScanDone = true;
+            v.steerRefines = 0;
+            remember();
+            LogInfo("[axlelift] %s: steering search at %.1f deg: %zu candidates (%.0f ms)", v.name, biggest * 360.0f, v.steerCand.size(),
+                    (NowSeconds() - t0) * 1000.0);
+            continue;
+        }
+        if (!v.steerScanDone || moved < 0.002f) continue;
+
+        SteerRefine(v);
+        remember();
+        ++v.steerRefines;
+        if (v.steerCand.empty()) {
+            LogDebug("[axlelift] %s: steering search lost every candidate - trying again", v.name);
+            v.steerScanDone = false; v.steerArmed = true;
+            continue;
+        }
+        if (v.steerRefines < 6 || v.steerCand.size() > 256) continue;
+        bool covered = true;
+        for (uint8_t a = 0; a < v.steerAxles.size(); ++a) {
+            bool any = false;
+            for (auto& t : v.steerCand) any |= t.axle == a;
+            covered &= any;
+        }
+        if (!covered && v.steerRefines < 30) continue;   // give the other axles time to show up
+        if (!covered) {
+            LogInfo("[axlelift] %s: steering of some axles not found - searching again", v.name);
+            v.steerScanDone = false; v.steerArmed = true; Wipe(v.steerCand);
+            continue;
+        }
+        v.steerFound = true;
+        LogInfo("[axlelift] %s: steering lock ready (%zu values)", v.name, v.steerCand.size());
+        for (auto& t : v.steerCand) LogDebug("[axlelift]   steering %p axle %u unit %u", (void*)t.addr, t.axle + 1, t.unit);
+        Notify("%s: steering lock ready", v.name);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // per frame
 // ---------------------------------------------------------------------------
 void ScanTick()
 {
     bool scannedThisFrame = false; // at most one full scan per frame
     ProbeTick();
+    SteerScanTick(scannedThisFrame);
 
     for (Vehicle& v : g_vehicles) {
         if (!v.present || v.axles.empty()) continue;
@@ -532,6 +717,15 @@ void WriteDiagnostics()
             fprintf(f, "   wheel %u liftable=%d z=%.3f lift=%.3f offset=%.5f deflection=%.5f ground=%d\n", i, w.liftable, w.posZ,
                     w.gameLift, w.liftOffset, w.deflection, w.onGround);
         }
+        for (unsigned i = 0; i < v.wheelCount; ++i)
+            if (v.wheels[i].steerable) fprintf(f, "   wheel %u steerable, steering %.5f rot, steer axle %d\n", i, v.wheels[i].steering, v.wheels[i].steerAxle);
+        fprintf(f, "  steering: armed=%d scanned=%d found=%d refines=%u values=%zu\n", v.steerArmed, v.steerScanDone, v.steerFound,
+                v.steerRefines, v.steerCand.size());
+        if (v.steerFound)
+            for (auto& t : v.steerCand) {
+                fprintf(f, "  steering value %p axle %u unit %u:\n", (void*)t.addr, t.axle + 1, t.unit);
+                HexDump(f, (t.addr - 0x40) & ~(uintptr_t)0xF, 0x90);
+            }
         if (!v.found) continue;
         for (auto& l : v.altLists) {
             DiagNode d{ l.first, -1, 0, 0, "" };
@@ -568,7 +762,7 @@ void WriteDiagnostics()
         if (!nodes.empty() && a >= (uintptr_t)nodes.data() && a < (uintptr_t)(nodes.data() + nodes.capacity())) return true;
         for (const Vehicle& v : g_vehicles) {
             auto in = [&](const void* d, size_t bytes) { return d && a >= (uintptr_t)d && a < (uintptr_t)d + bytes; };
-            if (in(v.cand.data(), v.cand.capacity() * 8) || in(v.wheelTargets.data(), v.wheelTargets.capacity() * sizeof(WheelTarget)) ||
+            if (in(v.cand.data(), v.cand.capacity() * 8) || in(v.steerCand.data(), v.steerCand.capacity() * sizeof(SteerTarget)) || in(v.wheelTargets.data(), v.wheelTargets.capacity() * sizeof(WheelTarget)) ||
                 in(v.altLists.data(), v.altLists.capacity() * sizeof(v.altLists[0]))) return true;
         }
         return false;

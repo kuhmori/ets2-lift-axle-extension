@@ -1,8 +1,11 @@
-### What's new in 1.0.0-beta5
+### What's new in 1.0.0-beta6
 
-- **Fixed:** steerable lift axles stayed locked straight after the plugin lowered them until the game's lift key was pressed. Steering now works normally. Thanks to **MVD** for reporting it.
-- **Fixed:** automatic mode "when reversing" now puts the axles back to their previous state when you drive forward again. Thanks to **Quichenic** for reporting it.
-- **Removed:** axle load display, overload protection and the load-based automatic rules. The loads from the game's physics weren't reliable enough. Automatic mode is now the reversing rule only; old settings are ignored.
+- **New: steering lock.** Steered trailer axles (and the truck's steered pusher / tag axles) can now be held straight. In the overlay, every steered axle has two checkboxes:
+  - **Lock** – straight all the time
+  - **Reverse** – straight only while reversing, steers normally again when you drive forward
+- Locking and releasing are **smooth**: the wheels ease to straight and back to the game's steering. Adjust the speed with *Settings → Steering centering time*.
+- **Setup:** drive through a turn or two once after coupling, so the steered axles move. The overlay shows *"steering lock ready"* when it's done.
+- Lifted steered axles are left alone; the game already holds them straight.
 
 Full history: [CHANGELOG.md](https://github.com/kuhmori/ets2-lift-axle-extension/blob/main/CHANGELOG.md)
 
@@ -21,6 +24,7 @@ Full history: [CHANGELOG.md](https://github.com/kuhmori/ets2-lift-axle-extension
 
 1. Couple a trailer with lift axles and **lift or lower them once with the game's own lift key** – the plugin sets itself up while they move (the game pauses ~3 s, once per trailer).
 2. Press **`Alt+O`** to open the overlay and click an axle.
+3. For the steering lock, drive through a turn once, then tick *Lock* or *Reverse* next to a steered axle.
 
 Default keys: trailer 1 axles `Alt+1`…`Alt+8`, truck axles `Ctrl+Alt+1`…`Ctrl+Alt+8`, release all `Alt+0`. Change them (also to wheel / gamepad buttons) in the overlay.
 
