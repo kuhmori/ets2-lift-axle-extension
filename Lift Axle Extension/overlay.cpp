@@ -13,7 +13,7 @@
 // state shared between the game thread (publishes) and the render thread (draws)
 // ---------------------------------------------------------------------------
 struct UiAxle { float pos = 0; bool up = false, controlled = false, releasing = false; };
-struct UiSteer { float angle = 0; bool locking = false, releasing = false, lifted = false; };
+struct UiSteer { float angle = 0; bool locking = false, releasing = false, lifted = false, ready = false; };
 struct UiVehicle {
     bool present = false, found = false, scanning = false, uncertain = false, canSwap = false, notRecognised = false, probing = false;
     char name[24] = "";
@@ -72,7 +72,7 @@ void OverlayPublish()
         if (!u.present) continue;
         snprintf(u.name, sizeof(u.name), "%s", v.name);
         u.found = v.found;
-        u.scanning = !v.found && (v.scanArmed || v.scanDone);
+        u.scanning = !v.found && (v.scanArmed || v.scanDone || v.scanRunning);
         u.notRecognised = !v.found && v.detectFails >= 2;
         u.uncertain = v.uncertain;
         u.probing = v.found && v.probeNeeded && ProbeActive();
@@ -91,7 +91,7 @@ void OverlayPublish()
         }
         u.steerCount = (unsigned)v.steerAxles.size();
         u.steerFound = v.steerFound;
-        u.steerSearching = v.steerScanDone && !v.steerFound;
+        u.steerSearching = v.steerSearching || !v.steerPend.empty();
         for (unsigned i = 0; i < u.steerCount; ++i) {
             const SteerAxle& a = v.steerAxles[i];
             float ang = 0.0f;
@@ -100,6 +100,7 @@ void OverlayPublish()
             u.steer[i].locking = a.locking;
             u.steer[i].releasing = a.locking && !a.holding;
             u.steer[i].lifted = SteerAxleLifted(v, a);
+            u.steer[i].ready = SteerAxleReady(v, i);
         }
     }
     std::lock_guard<std::mutex> lock(g_uiMutex);
@@ -304,9 +305,12 @@ static void DrawVehicle(const UiState& st, unsigned slot)
 
     // steered axles: lock straight while reversing
     if (u.steerCount) {
-        if (!u.steerFound)
-            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", u.steerSearching ? "Steering lock setup: keep driving through a few turns..."
-                                                                                : "Steering lock setup: drive through a turn once (the steered axles have to move).");
+        bool allReady = true;
+        for (unsigned i = 0; i < u.steerCount; ++i) allReady &= u.steer[i].ready || u.steer[i].lifted;
+        if (u.steerSearching)
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Steering lock setup: keep driving through a few turns...");
+        else if (!allReady)
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "Steering lock setup: drive through a turn (the steered axles have to move).");
         if (ImGui::BeginTable("steer", 4, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
             ImGui::TableSetupColumn("Steered axle", ImGuiTableColumnFlags_WidthFixed, 120);
             ImGui::TableSetupColumn("Steering", ImGuiTableColumnFlags_WidthFixed, 120);
@@ -323,6 +327,7 @@ static void DrawVehicle(const UiState& st, unsigned slot)
                 if (a.releasing) ImGui::Text("releasing %+.1f deg", a.angle);
                 else if (a.locking) ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), std::fabs(a.angle) > 0.3f ? "centering %+.1f deg" : "LOCKED %+.1f deg", a.angle);
                 else if (a.lifted) ImGui::TextDisabled("lifted - held straight");
+                else if (!a.ready) ImGui::TextDisabled("setup: steer once");
                 else ImGui::Text("free %+.1f deg", a.angle);
                 ImGui::TableNextColumn();
                 bool lock = s.steerLock[slot][i], rev = s.steerLockRev[slot][i];

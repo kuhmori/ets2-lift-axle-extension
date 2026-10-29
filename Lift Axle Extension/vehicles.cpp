@@ -104,7 +104,7 @@ void OnVehicleConfig(const char* id, const scs_named_value_t* attributes)
         for (unsigned w : sa.wheels) v.wheels[w].steerAxle = (int)v.steerAxles.size();
         v.steerAxles.push_back(sa);
     }
-    v.steerArmed = !v.steerAxles.empty();   // found the first time these axles steer (drive through a turn)
+    // steering values are searched (in the background) the first time each axle steers
 
     LogInfo("[axlelift] %s: %u wheels, %u axles, %u liftable, %u steered (lockable)", v.name, count, (unsigned)v.axleZ.size(),
             (unsigned)v.axles.size(), (unsigned)v.steerAxles.size());
@@ -383,7 +383,7 @@ void UpdateSteering(float dt)
             SteerAxle& a = v.steerAxles[i];
             bool wanted = g_settings.steerLock[s][i] || (g_settings.steerLockRev[s][i] && reversing);
             // a lifted steered axle is already held straight by the game
-            bool want = wanted && v.steerFound && !g_blocked && !SteerAxleLifted(v, a);
+            bool want = wanted && SteerAxleReady(v, i) && !g_blocked && !SteerAxleLifted(v, a);
             if (want && !a.locking) {
                 // start centering smoothly from where the wheels are now
                 a.locking = true; a.blend = 1.0f; a.straightSince = 0.0; a.noEffectWarned = false;

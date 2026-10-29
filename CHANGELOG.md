@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.0-beta7
+
+### Fixed
+- The game froze for several seconds while the plugin set itself up (first lift with the game key, first turn for the steering lock). The memory searches now run in the background and the game keeps running. They are also faster.
+- With lifted steered axles, the steering lock setup started over again and again (another freeze each time), because lifted axles never steer and were never found. Each steered axle is now set up on its own, the first time it actually steers; the others are ready right away.
+
+### Changed
+- An axle whose steering data is not found yet shows *setup: steer once* in the overlay.
+- If one axle's steering data stops working, only that axle is set up again; the locks of the other axles keep working.
+
 ## 1.0.0-beta6
 
 ### Added

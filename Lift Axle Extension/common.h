@@ -32,7 +32,7 @@
 #include "common/scssdk_telemetry_truck_common_channels.h"
 #include "common/scssdk_telemetry_trailer_common_channels.h"
 
-#define AXLELIFT_VERSION "1.0.0-beta6"
+#define AXLELIFT_VERSION "1.0.0-beta7"
 
 // ---------------------------------------------------------------------------
 // limits
@@ -172,6 +172,8 @@ struct Vehicle {
     // memory (memscan.cpp)
     std::vector<uintptr_t> cand;
     bool scanArmed = false, scanDone = false;
+    bool scanRunning = false;     // background search in progress
+    unsigned liftGen = 0;         // bumped when the lift data is reset (stale search results are dropped)
     float lastL = -1.0f;
     bool found = false;
     unsigned detectFails = 0;     // lift movements seen without recognising the data
@@ -186,9 +188,15 @@ struct Vehicle {
 
     // steering lock (memscan.cpp finds, vehicles.cpp writes)
     std::vector<SteerAxle> steerAxles;   // lockable steered axles, front to back
-    std::vector<SteerTarget> steerCand;  // search / found steering values
-    bool steerArmed = false, steerScanDone = false, steerFound = false;
-    unsigned steerRefines = 0;
+    std::vector<SteerTarget> steerCand;  // confirmed steering values (used for locking)
+    std::vector<SteerTarget> steerPend;  // search results still being confirmed
+    uint32_t steerPendMask = 0;          // axles the running / pending search is for
+    unsigned steerPendRefines = 0;
+    double steerPendSince = 0.0, steerRetryAt = 0.0;
+    bool steerSearching = false;         // background search in progress
+    bool steerFound = false;             // at least one axle ready
+    unsigned steerGen = 0;
+    float steerMax[MAX_STEER_AXLES] = {}; // largest angle seen per axle (has it steered at all?)
     float steerLast[MAX_WHEELS] = {};    // telemetry at the last refine
     double steerUnlockedAt = 0.0;        // last time a lock ended (memory needs a moment to follow the game again)
 };
@@ -214,6 +222,7 @@ float AxleUiPos(const Vehicle& v, const Axle& a);
 bool  AxleUiUp(const Vehicle& v, const Axle& a);
 void UpdateSteering(float dt);        // steering lock (called from UpdateAxles)
 bool SteerAxleLifted(const Vehicle& v, const SteerAxle& a);
+bool SteerAxleReady(const Vehicle& v, unsigned axle);   // steering values found for this axle
 
 // ---------------------------------------------------------------------------
 // memory (memscan.cpp)
@@ -225,6 +234,7 @@ void RescanVehicle(unsigned slot);
 void DataLost(unsigned slot);         // our memory no longer drives this vehicle: set up again
 void ResetTargets(Vehicle& v);
 bool ProbeActive();                   // telling identical trailers apart right now
+void ScanShutdown();                  // stop a background search (plugin unload)
 void ResetSteer(Vehicle& v);          // forget the steering memory (layout changed / data lost)
 float SteerExpected(unsigned unit, float rotations);
 bool  SteerMatches(const Vehicle& v, const SteerTarget& t, float value);

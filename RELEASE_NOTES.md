@@ -1,11 +1,10 @@
-### What's new in 1.0.0-beta6
+### What's new in 1.0.0-beta7
 
-- **New: steering lock.** Steered trailer axles (and the truck's steered pusher / tag axles) can now be held straight. In the overlay, every steered axle has two checkboxes:
-  - **Lock** – straight all the time
-  - **Reverse** – straight only while reversing, steers normally again when you drive forward
-- Locking and releasing are **smooth**: the wheels ease to straight and back to the game's steering. Adjust the speed with *Settings → Steering centering time*.
-- **Setup:** drive through a turn or two once after coupling, so the steered axles move. The overlay shows *"steering lock ready"* when it's done.
-- Lifted steered axles are left alone; the game already holds them straight.
+- **Fixed: no more freezes during setup.** Finding the lift data (first lift with the game key) and the steering data (first turn) used to freeze the game for several seconds. Both searches now run in the background – the game keeps running.
+- **Fixed:** with lifted steered axles, the steering lock setup kept starting over (another freeze each time). Each steered axle is now set up on its own, the first time it actually steers. Until then it shows *"setup: steer once"* in the overlay.
+- If one axle's steering data stops working, only that axle is set up again; the other locks keep working.
+
+New in 1.0.0-beta6: **steering lock** – hold steered trailer axles (and the truck's steered pusher / tag axles) straight, always (*Lock*) or only while reversing (*Reverse*), with smooth centering and release.
 
 Full history: [CHANGELOG.md](https://github.com/kuhmori/ets2-lift-axle-extension/blob/main/CHANGELOG.md)
 
@@ -22,7 +21,7 @@ Full history: [CHANGELOG.md](https://github.com/kuhmori/ets2-lift-axle-extension
 
 ### First use
 
-1. Couple a trailer with lift axles and **lift or lower them once with the game's own lift key** – the plugin sets itself up while they move (the game pauses ~3 s, once per trailer).
+1. Couple a trailer with lift axles and **lift or lower them once with the game's own lift key** – the plugin sets itself up in the background while they move (once per trailer).
 2. Press **`Alt+O`** to open the overlay and click an axle.
 3. For the steering lock, drive through a turn once, then tick *Lock* or *Reverse* next to a steered axle.
 

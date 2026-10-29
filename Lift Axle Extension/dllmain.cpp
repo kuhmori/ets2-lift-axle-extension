@@ -290,6 +290,7 @@ SCSAPI_RESULT scs_telemetry_init(const scs_u32_t version, const scs_telemetry_in
 
 SCSAPI_VOID scs_telemetry_shutdown(void)
 {
+    ScanShutdown();          // stop a background search before the DLL goes away
     OverlayShutdown();
     InputShutdown();
     RemoveInputHooks();

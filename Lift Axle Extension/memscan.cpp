@@ -6,6 +6,8 @@
 //                lift float at obj+0x80 and obj+0x150 (visual / suspension)
 #include "common.h"
 
+#include <emmintrin.h>
+
 #pragma comment(lib, "version.lib")
 
 static const char* kTestedVersions[] = { "1.61.1.9" };
@@ -72,27 +74,135 @@ template <typename F> static void ForEachResidentRun(F&& fn)
 // ---------------------------------------------------------------------------
 static const size_t MAX_CANDIDATES = 20000000;
 
-static bool FirstScan(Vehicle& v, float target, float tol)
+static const size_t MAX_STEER_CANDIDATES = 4000000;
+
+// ---------------------------------------------------------------------------
+// background search: reads all of the game's memory on a worker thread so the game keeps running.
+// The value we look for keeps changing while the search runs, so the game thread feeds the
+// latest telemetry values in every frame and each 1 MB chunk is compared against a narrow band
+// around the value at that moment (last value, previous value and where it is heading).
+// The game thread then confirms the matches over the next frames as before.
+// ---------------------------------------------------------------------------
+struct ScanSeries {
+    uint8_t axle, unit;
+    float prev, latest, tol;
+    float minAbs, maxAbs;   // value at its rest position (0 / straight, or fully up) is everywhere in memory -> not searched
+
+    bool valid;
+};
+struct ScanHit { uintptr_t addr; uint8_t axle, unit; };
+
+struct ScanJob {
+    std::thread th;
+    std::atomic<int> state{0};          // 0 idle, 1 running, 2 finished, 3 too many matches
+    std::atomic<bool> abort{false};
+    bool steer = false;
+    unsigned slot = 0, gen = 0;
+    double startedAt = 0.0;
+    size_t skipped = 0, scanned = 0;    // bytes read while the value was at rest (not searched)
+    std::mutex m;
+    std::vector<ScanSeries> series;     // game thread updates prev / latest
+    std::vector<ScanHit> hits;
+};
+static ScanJob g_job;
+
+static bool JobIdle() { return g_job.state == 0; }
+
+static void ScanWorker()
 {
-    Wipe(v.cand);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    struct Band { float lo, hi; uint8_t axle, unit; };
+    std::vector<Band> bands;
     std::vector<uint8_t> buf(1 << 20);
+    const size_t cap = g_job.steer ? MAX_STEER_CANDIDATES : MAX_CANDIDATES;
     bool overflow = false;
+
     ForEachResidentRun([&](uintptr_t addr, size_t n) {
-        if (n > buf.size()) buf.resize(n);
-        if (!ReadMem(addr, buf.data(), n)) return true;
-        for (size_t off = 0; off + 4 <= n; off += 4) {
-            float f; memcpy(&f, &buf[off], 4);
-            if (std::fabs(f - target) < tol) {
-                v.cand.push_back(addr + off);
-                if (v.cand.size() >= MAX_CANDIDATES) { overflow = true; return false; }
+        if (g_job.abort) return false;
+        // bands for this chunk from the newest values
+        bands.clear();
+        {
+            std::lock_guard<std::mutex> lock(g_job.m);
+            for (const ScanSeries& sr : g_job.series) {
+                if (!sr.valid || std::fabs(sr.latest) < sr.minAbs || std::fabs(sr.latest) > sr.maxAbs) continue;
+                float next = sr.latest + 2.0f * (sr.latest - sr.prev);
+                float lo = std::min(std::min(sr.prev, sr.latest), next) - sr.tol;
+                float hi = std::max(std::max(sr.prev, sr.latest), next) + sr.tol;
+                bands.push_back({ lo, hi, sr.axle, sr.unit });
             }
         }
+        if (bands.empty()) { g_job.skipped += n; return true; }
+        float absLo = 1e30f, absHi = 0.0f;
+        for (const Band& b : bands) {
+            absLo = std::min(absLo, (b.lo <= 0.0f && b.hi >= 0.0f) ? 0.0f : std::min(std::fabs(b.lo), std::fabs(b.hi)));
+            absHi = std::max(absHi, std::max(std::fabs(b.lo), std::fabs(b.hi)));
+        }
+        uint32_t bitsLo, bitsHi;
+        memcpy(&bitsLo, &absLo, 4); memcpy(&bitsHi, &absHi, 4);
+
+        if (n > buf.size()) buf.resize(n);
+        if (!ReadMem(addr, buf.data(), n)) return true;
+        g_job.scanned += n;
+        auto check = [&](size_t off) {
+            float f; memcpy(&f, &buf[off], 4);
+            for (const Band& b : bands)
+                if (f >= b.lo && f <= b.hi) { g_job.hits.push_back({ addr + off, b.axle, b.unit }); return; }
+        };
+        // 4 floats at a time: |f| (as integer bits) inside the band range?
+        const __m128i absMask = _mm_set1_epi32(0x7FFFFFFF);
+        const __m128i vLo = _mm_set1_epi32((int)bitsLo - 1), vHi = _mm_set1_epi32((int)bitsHi + 1);
+        size_t off = 0;
+        for (; off + 16 <= n; off += 16) {
+            __m128i x = _mm_and_si128(_mm_loadu_si128((const __m128i*)&buf[off]), absMask);
+            int m = _mm_movemask_ps(_mm_castsi128_ps(_mm_and_si128(_mm_cmpgt_epi32(x, vLo), _mm_cmplt_epi32(x, vHi))));
+            if (!m) continue;
+            for (int k = 0; k < 4; ++k) if (m & (1 << k)) check(off + 4 * k);
+            if (g_job.hits.size() >= cap) { overflow = true; return false; }
+        }
+        for (; off + 4 <= n; off += 4) check(off);
         return true;
     });
     Wipe(buf);
-    if (overflow) Wipe(v.cand);
-    return !overflow;
+    if (overflow) Wipe(g_job.hits);
+    g_job.state = overflow ? 3 : 2;
 }
+
+// game thread: newest values for the running search
+static void FeedJob(float (*value)(const Vehicle&, const ScanSeries&))
+{
+    if (g_job.state != 1) return;
+    const Vehicle& v = g_vehicles[g_job.slot];
+    std::lock_guard<std::mutex> lock(g_job.m);
+    for (ScanSeries& sr : g_job.series) {
+        float x = value(v, sr);
+        if (!std::isfinite(x)) { sr.valid = false; continue; }
+        if (!sr.valid) { sr.prev = sr.latest = x; sr.valid = true; continue; }
+        sr.prev = sr.latest; sr.latest = x;
+    }
+}
+
+static void StartJob(bool steer, unsigned slot, unsigned gen, std::vector<ScanSeries> series)
+{
+    if (g_job.th.joinable()) g_job.th.join();
+    Wipe(g_job.hits);
+    g_job.series = std::move(series);
+    g_job.steer = steer; g_job.slot = slot; g_job.gen = gen;
+    g_job.skipped = g_job.scanned = 0;
+    g_job.startedAt = NowSeconds();
+    g_job.abort = false;
+    g_job.state = 1;
+    g_job.th = std::thread(ScanWorker);
+}
+
+void ScanShutdown()
+{
+    g_job.abort = true;
+    if (g_job.th.joinable()) g_job.th.join();
+    Wipe(g_job.hits);
+    g_job.state = 0;
+}
+
+static float LiftValue(const Vehicle& v, const ScanSeries&) { return v.axles.empty() ? NAN : v.wheels[v.axles[0].wheels[0]].gameLift; }
 
 static void Refine(Vehicle& v, float target, float tol)
 {
@@ -115,7 +225,8 @@ static void Refine(Vehicle& v, float target, float tol)
 void ResetTargets(Vehicle& v)
 {
     Wipe(v.cand);
-    v.scanArmed = v.scanDone = false;
+    v.scanArmed = v.scanDone = v.scanRunning = false;
+    ++v.liftGen;
     v.found = v.uncertain = false;
     v.axleList = 0; v.listReversed = false;
     Wipe(v.wheelTargets);
@@ -345,7 +456,7 @@ static void ProbeTick()
         std::vector<unsigned> slots;
         for (const Vehicle& v : g_vehicles) {
             if (!v.present || v.axles.empty()) continue;
-            if (!v.found && v.scanDone) return;                      // another trailer is still being found
+            if (!v.found && (v.scanDone || v.scanRunning)) return;   // another trailer is still being found
             if (v.found && v.probeNeeded) slots.push_back(v.slot);
         }
         if (slots.empty()) return;
@@ -417,7 +528,6 @@ static void ProbeTick()
 // sign. First search: every float matching a steered wheel's angle. Then follow the angle while
 // the axle steers; only values that track it through several different angles are kept.
 // ---------------------------------------------------------------------------
-static const size_t MAX_STEER_CANDIDATES = 4000000;
 static const float  TWO_PI = 6.28318531f;
 
 float SteerExpected(unsigned unit, float rot)
@@ -436,163 +546,192 @@ bool SteerMatches(const Vehicle& v, const SteerTarget& t, float value)
     return false;
 }
 
+bool SteerAxleReady(const Vehicle& v, unsigned axle)
+{
+    for (const SteerTarget& t : v.steerCand) if (t.axle == axle) return true;
+    return false;
+}
+
 void ResetSteer(Vehicle& v)
 {
     Wipe(v.steerCand);
-    v.steerArmed = !v.steerAxles.empty();
-    v.steerScanDone = v.steerFound = false;
-    v.steerRefines = 0;
+    Wipe(v.steerPend);
+    v.steerPendMask = 0; v.steerPendRefines = 0;
+    v.steerSearching = v.steerFound = false;
+    v.steerRetryAt = 0.0;
+    ++v.steerGen;
+    for (float& m : v.steerMax) m = 0.0f;
     for (auto& a : v.steerAxles) { a.locking = a.holding = false; a.blend = 1.0f; a.noEffectWarned = false; }
 }
 
-static bool SteerFirstScan(Vehicle& v)
+// series index -> (wheel, unit): series.axle holds the WHEEL here, the axle is looked up when done
+static float SteerValue(const Vehicle& v, const ScanSeries& sr)
 {
-    struct T { float val, tol; uint8_t axle, unit; };
-    std::vector<T> targets;
-    for (unsigned i = 0; i < v.steerAxles.size(); ++i)
-        for (unsigned w : v.steerAxles[i].wheels) {
-            float rot = v.wheels[w].steering;
-            if (std::fabs(rot) < 0.005f) continue;
-            for (uint8_t u = 0; u < 4; ++u) targets.push_back({ SteerExpected(u, rot), SteerTol(u), (uint8_t)i, u });
-        }
-    if (targets.empty()) return false;
-    std::sort(targets.begin(), targets.end(), [](const T& a, const T& b) { return a.val < b.val; });
-    const float maxTol = SteerTol(2);
-    // quick reject: every target lies in a narrow band of absolute values
-    float absLo = 1e9f, absHi = 0.0f;
-    for (const T& t : targets) { absLo = std::min(absLo, std::fabs(t.val) - maxTol); absHi = std::max(absHi, std::fabs(t.val) + maxTol); }
-    uint32_t bitsLo, bitsHi;
-    { float lo = std::max(absLo, 1e-6f); memcpy(&bitsLo, &lo, 4); memcpy(&bitsHi, &absHi, 4); }
-
-    Wipe(v.steerCand);
-    std::vector<uint8_t> buf(1 << 20);
-    bool overflow = false;
-    ForEachResidentRun([&](uintptr_t addr, size_t n) {
-        if (n > buf.size()) buf.resize(n);
-        if (!ReadMem(addr, buf.data(), n)) return true;
-        for (size_t off = 0; off + 4 <= n; off += 4) {
-            uint32_t bits; memcpy(&bits, &buf[off], 4);
-            bits &= 0x7FFFFFFFu;                                   // |f| as bits: integer compare, no float math
-            if (bits < bitsLo || bits > bitsHi) continue;
-            float f; memcpy(&f, &buf[off], 4);
-            auto it = std::lower_bound(targets.begin(), targets.end(), f - maxTol, [](const T& t, float x) { return t.val < x; });
-            for (; it != targets.end() && it->val <= f + maxTol; ++it) {
-                if (std::fabs(f - it->val) >= it->tol) continue;
-                v.steerCand.push_back({ addr + off, it->axle, it->unit, 0, 0.0f, 0.0f });
-                break;
-            }
-            if (v.steerCand.size() >= MAX_STEER_CANDIDATES) { overflow = true; return false; }
-        }
-        return true;
-    });
-    Wipe(buf);
-    if (overflow) Wipe(v.steerCand);
-    return !overflow;
+    return sr.axle < v.wheelCount ? SteerExpected(sr.unit, v.wheels[sr.axle].steering) : NAN;
 }
 
-// keep candidates that still match; a value may move to another axle of the same vehicle
-static void SteerRefine(Vehicle& v)
+static void StartSteerJob(Vehicle& v, uint32_t mask)
+{
+    std::vector<ScanSeries> series;
+    for (unsigned i = 0; i < v.steerAxles.size(); ++i) {
+        if (!(mask & (1u << i))) continue;
+        for (unsigned w : v.steerAxles[i].wheels)
+            for (uint8_t u = 0; u < 4; ++u) {
+                float x = SteerExpected(u, v.wheels[w].steering);
+                float scale = u >= 2 ? TWO_PI : 1.0f;
+                series.push_back({ (uint8_t)w, u, x, x, SteerTol(u), 0.004f * scale, 1e3f, true });
+            }
+    }
+    v.steerSearching = true;
+    v.steerPendMask = mask;
+    StartJob(true, v.slot, v.steerGen, std::move(series));
+    LogDebug("[axlelift] %s: steering search started in the background", v.name);
+}
+
+// keep candidates that still match; a value may move to another axle the search was for
+static void SteerRefinePend(Vehicle& v)
 {
     std::vector<SteerTarget> keep;
-    keep.reserve(v.steerCand.size() / 4 + 16);
+    keep.reserve(v.steerPend.size() / 4 + 16);
     uint8_t page[4096];
     uintptr_t cur = 0; bool ok = false;
-    for (SteerTarget t : v.steerCand) {
+    for (SteerTarget t : v.steerPend) {
         uintptr_t pg = t.addr & ~(uintptr_t)0xFFF;
         if (pg != cur || !cur) { cur = pg; ok = ReadMem(pg, page, sizeof(page)); }
         if (!ok) continue;
         float f; memcpy(&f, &page[t.addr - pg], 4);
         if (SteerMatches(v, t, f)) { keep.push_back(t); continue; }
         for (uint8_t a = 0; a < v.steerAxles.size(); ++a) {
+            if (a == t.axle || !(v.steerPendMask & (1u << a))) continue;
             SteerTarget o = t; o.axle = a;
-            if (a != t.axle && SteerMatches(v, o, f)) { keep.push_back(o); break; }
+            if (SteerMatches(v, o, f)) { keep.push_back(o); break; }
         }
     }
-    v.steerCand.swap(keep);
-    v.steerCand.shrink_to_fit();
+    v.steerPend.swap(keep);
+    v.steerPend.shrink_to_fit();
     Wipe(keep);
 }
 
-static void SteerScanTick(bool& scannedThisFrame)
+static void SteerScanTick()
 {
     double now = NowSeconds();
     for (Vehicle& v : g_vehicles) {
         if (!v.present || v.steerAxles.empty()) continue;
 
-        float moved = 0.0f, biggest = 0.0f;
-        for (auto& a : v.steerAxles)
-            for (unsigned w : a.wheels) {
+        float moved = 0.0f;
+        for (unsigned i = 0; i < v.steerAxles.size(); ++i)
+            for (unsigned w : v.steerAxles[i].wheels) {
                 moved = std::max(moved, std::fabs(v.wheels[w].steering - v.steerLast[w]));
-                biggest = std::max(biggest, std::fabs(v.wheels[w].steering));
+                v.steerMax[i] = std::max(v.steerMax[i], std::fabs(v.wheels[w].steering));
             }
         auto remember = [&]() { for (unsigned w = 0; w < v.wheelCount; ++w) v.steerLast[w] = v.wheels[w].steering; };
 
-        if (v.steerFound) {
-            // still the right memory? (not while we write it ourselves, nor right after)
-            bool locking = false;
-            for (auto& a : v.steerAxles) locking |= a.locking;
-            if (locking || now - v.steerUnlockedAt < 0.5) continue;
+        // confirmed values: still the right memory? (not while we write them ourselves, nor right after)
+        bool locking = false;
+        for (auto& a : v.steerAxles) locking |= a.locking;
+        if (!v.steerCand.empty() && !locking && now - v.steerUnlockedAt >= 0.5) {
             for (size_t i = 0; i < v.steerCand.size();) {
                 SteerTarget& t = v.steerCand[i];
                 float f;
                 if (ReadMem(t.addr, &f, 4) && SteerMatches(v, t, f)) t.miss = 0;
-                else if (++t.miss > 60) { v.steerCand.erase(v.steerCand.begin() + i); continue; }
+                else if (++t.miss > 60) {
+                    unsigned ax = t.axle;
+                    v.steerCand.erase(v.steerCand.begin() + i);
+                    if (!SteerAxleReady(v, ax))
+                        Log(SCS_LOG_TYPE_warning, "[axlelift] %s steered axle %u: steering memory no longer valid - searching again when it steers", v.name, ax + 1);
+                    continue;
+                }
                 ++i;
             }
-            bool covered = true;
-            for (uint8_t a = 0; a < v.steerAxles.size(); ++a) {
-                bool any = false;
-                for (auto& t : v.steerCand) any |= t.axle == a;
-                covered &= any;
-            }
-            if (!covered) {
-                Log(SCS_LOG_TYPE_warning, "[axlelift] %s: steering memory no longer valid - searching again", v.name);
-                ResetSteer(v);
-                remember();
-            }
-            continue;
+            v.steerFound = !v.steerCand.empty();
         }
 
-        if (v.steerArmed && !v.steerScanDone && biggest > 0.01f && !scannedThisFrame) {
-            double t0 = NowSeconds();
-            scannedThisFrame = true;
-            v.steerArmed = false;
-            if (!SteerFirstScan(v)) { LogDebug("[axlelift] %s: steering search - too many matches, trying again", v.name); v.steerArmed = true; continue; }
-            v.steerScanDone = true;
-            v.steerRefines = 0;
+        // search results being confirmed: follow the angle through several different values
+        if (!v.steerPend.empty() && moved >= 0.002f) {
+            SteerRefinePend(v);
             remember();
-            LogInfo("[axlelift] %s: steering search at %.1f deg: %zu candidates (%.0f ms)", v.name, biggest * 360.0f, v.steerCand.size(),
-                    (NowSeconds() - t0) * 1000.0);
-            continue;
+            ++v.steerPendRefines;
+            if (v.steerPend.empty()) {
+                LogDebug("[axlelift] %s: steering search found nothing that follows the wheels - trying again later", v.name);
+                v.steerRetryAt = now + 5.0;
+            } else if (v.steerPendRefines >= 6 && v.steerPend.size() <= 256) {
+                uint32_t got = 0;
+                for (const SteerTarget& t : v.steerPend) got |= 1u << t.axle;
+                for (const SteerTarget& t : v.steerPend)
+                    if (!SteerAxleReady(v, t.axle) || (got & (1u << t.axle))) v.steerCand.push_back(t);
+                Wipe(v.steerPend);
+                v.steerFound = true;
+                v.steerRetryAt = now + 10.0;    // axles that didn't show up: next search not right away
+                LogInfo("[axlelift] %s: steering lock ready (%zu values)", v.name, v.steerCand.size());
+                for (auto& t : v.steerCand) LogDebug("[axlelift]   steering %p axle %u unit %u", (void*)t.addr, t.axle + 1, t.unit);
+                Notify("%s: steering lock ready", v.name);
+            }
         }
-        if (!v.steerScanDone || moved < 0.002f) continue;
+        if (!v.steerPend.empty() && now - v.steerPendSince > 120.0) {   // never confirmed: start over later
+            Wipe(v.steerPend);
+            v.steerRetryAt = now + 5.0;
+        }
 
-        SteerRefine(v);
-        remember();
-        ++v.steerRefines;
-        if (v.steerCand.empty()) {
-            LogDebug("[axlelift] %s: steering search lost every candidate - trying again", v.name);
-            v.steerScanDone = false; v.steerArmed = true;
-            continue;
+        // start a search for axles that steer but have no values yet (one search at a time, in the background)
+        if (v.steerSearching || !v.steerPend.empty() || now < v.steerRetryAt || !JobIdle()) continue;
+        uint32_t mask = 0;
+        for (unsigned i = 0; i < v.steerAxles.size(); ++i) {
+            if (SteerAxleReady(v, i)) continue;
+            float cur = 0.0f;
+            for (unsigned w : v.steerAxles[i].wheels) cur = std::max(cur, std::fabs(v.wheels[w].steering));
+            if (cur > 0.01f) mask |= 1u << i;
         }
-        if (v.steerRefines < 6 || v.steerCand.size() > 256) continue;
-        bool covered = true;
-        for (uint8_t a = 0; a < v.steerAxles.size(); ++a) {
-            bool any = false;
-            for (auto& t : v.steerCand) any |= t.axle == a;
-            covered &= any;
-        }
-        if (!covered && v.steerRefines < 30) continue;   // give the other axles time to show up
-        if (!covered) {
-            LogInfo("[axlelift] %s: steering of some axles not found - searching again", v.name);
-            v.steerScanDone = false; v.steerArmed = true; Wipe(v.steerCand);
-            continue;
-        }
-        v.steerFound = true;
-        LogInfo("[axlelift] %s: steering lock ready (%zu values)", v.name, v.steerCand.size());
-        for (auto& t : v.steerCand) LogDebug("[axlelift]   steering %p axle %u unit %u", (void*)t.addr, t.axle + 1, t.unit);
-        Notify("%s: steering lock ready", v.name);
+        if (mask) { remember(); StartSteerJob(v, mask); }
     }
+}
+
+// a background search finished: hand the result to its vehicle
+static void FinishJob()
+{
+    if (g_job.state != 2 && g_job.state != 3) return;
+    if (g_job.th.joinable()) g_job.th.join();
+    Vehicle& v = g_vehicles[g_job.slot];
+    double ms = (NowSeconds() - g_job.startedAt) * 1000.0;
+    bool tooMany = g_job.state == 3;
+    unsigned skippedPct = g_job.scanned + g_job.skipped ? (unsigned)(100 * g_job.skipped / (g_job.scanned + g_job.skipped)) : 0;
+    if (g_job.steer) {
+        v.steerSearching = false;
+        if (g_job.gen != v.steerGen || !v.present) { /* vehicle changed meanwhile */ }
+        else if (tooMany || g_job.hits.empty()) {
+            LogDebug("[axlelift] %s: steering search %s - trying again", v.name, tooMany ? "had too many matches" : "found nothing");
+            v.steerRetryAt = NowSeconds() + 5.0;
+        } else {
+            Wipe(v.steerPend);
+            v.steerPend.reserve(g_job.hits.size());
+            for (const ScanHit& h : g_job.hits) {
+                int ax = h.axle < v.wheelCount ? v.wheels[h.axle].steerAxle : -1;   // series held the wheel
+                if (ax >= 0) v.steerPend.push_back({ h.addr, (uint8_t)ax, h.unit, 0, 0.0f, 0.0f });
+            }
+            v.steerPendRefines = 0;
+            v.steerPendSince = NowSeconds();
+            LogInfo("[axlelift] %s: steering search: %zu candidates (%.0f ms in the background%s)", v.name, v.steerPend.size(), ms,
+                    skippedPct ? ", part searched while straight" : "");
+        }
+    } else {
+        v.scanRunning = false;
+        if (g_job.gen != v.liftGen || !v.present) { /* vehicle changed meanwhile */ }
+        else if (tooMany) {
+            Log(SCS_LOG_TYPE_warning, "[axlelift] %s: too many matches, trying again next time", v.name);
+            v.scanArmed = true;
+        } else {
+            Wipe(v.cand);
+            v.cand.reserve(g_job.hits.size());
+            for (const ScanHit& h : g_job.hits) v.cand.push_back(h.addr);
+            std::sort(v.cand.begin(), v.cand.end());
+            v.scanDone = true;
+            v.lastL = -1.0f;                   // confirm against the current value right away
+            LogInfo("[axlelift] %s: search: %zu candidates (%.0f ms in the background%s)", v.name, v.cand.size(), ms,
+                    skippedPct ? ", part searched after the axles stopped" : "");
+            if (v.cand.empty()) { v.scanDone = false; v.scanArmed = true; }
+        }
+    }
+    Wipe(g_job.hits);
+    g_job.state = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -600,9 +739,12 @@ static void SteerScanTick(bool& scannedThisFrame)
 // ---------------------------------------------------------------------------
 void ScanTick()
 {
-    bool scannedThisFrame = false; // at most one full scan per frame
+    // background search: give it the newest values, pick up the result when it's done
+    if (g_job.state == 1) FeedJob(g_job.steer ? SteerValue : LiftValue);
+    FinishJob();
+
     ProbeTick();
-    SteerScanTick(scannedThisFrame);
+    SteerScanTick();
 
     for (Vehicle& v : g_vehicles) {
         if (!v.present || v.axles.empty()) continue;
@@ -612,14 +754,14 @@ void ScanTick()
         bool atRest = L < 0.001f || L > 0.999f;
         bool lastAtRest = v.lastL < 0.001f || v.lastL > 0.999f;
 
-        if (v.scanArmed && !v.scanDone && L > 0.1f && L < 0.9f && !scannedThisFrame) {
-            double t0 = NowSeconds();
-            bool ok = FirstScan(v, L, 0.0005f);
-            scannedThisFrame = true;
+        // the axles started moving with the game key: search in the background while they move
+        if (v.scanArmed && !v.scanDone && !v.scanRunning && L > 0.02f && L < 0.98f && JobIdle()) {
             v.scanArmed = false;
-            if (!ok) { Log(SCS_LOG_TYPE_warning, "[axlelift] %s: too many matches, trying again next time", v.name); v.scanArmed = true; continue; }
-            v.scanDone = true; v.lastL = L;
-            LogInfo("[axlelift] %s: search at lift %.3f: %zu candidates (%.0f ms)", v.name, L, v.cand.size(), (NowSeconds() - t0) * 1000.0);
+            v.scanRunning = true;
+            // values right at the rest positions (0 / 1) are everywhere in memory: only searched while moving
+            std::vector<ScanSeries> series{ { 0, 0, L, L, 0.0005f, 0.02f, 0.98f, true } };
+            StartJob(false, v.slot, v.liftGen, std::move(series));
+            LogDebug("[axlelift] %s: lift search started in the background (lift %.3f)", v.name, L);
             continue;
         }
         if (v.scanDone && !v.cand.empty() && (std::fabs(L - v.lastL) > 0.005f || (atRest && !lastAtRest))) {
@@ -719,8 +861,8 @@ void WriteDiagnostics()
         }
         for (unsigned i = 0; i < v.wheelCount; ++i)
             if (v.wheels[i].steerable) fprintf(f, "   wheel %u steerable, steering %.5f rot, steer axle %d\n", i, v.wheels[i].steering, v.wheels[i].steerAxle);
-        fprintf(f, "  steering: armed=%d scanned=%d found=%d refines=%u values=%zu\n", v.steerArmed, v.steerScanDone, v.steerFound,
-                v.steerRefines, v.steerCand.size());
+        fprintf(f, "  steering: searching=%d found=%d values=%zu pending=%zu (refines %u, axles 0x%X)\n", v.steerSearching, v.steerFound,
+                v.steerCand.size(), v.steerPend.size(), v.steerPendRefines, v.steerPendMask);
         if (v.steerFound)
             for (auto& t : v.steerCand) {
                 fprintf(f, "  steering value %p axle %u unit %u:\n", (void*)t.addr, t.axle + 1, t.unit);
@@ -762,7 +904,8 @@ void WriteDiagnostics()
         if (!nodes.empty() && a >= (uintptr_t)nodes.data() && a < (uintptr_t)(nodes.data() + nodes.capacity())) return true;
         for (const Vehicle& v : g_vehicles) {
             auto in = [&](const void* d, size_t bytes) { return d && a >= (uintptr_t)d && a < (uintptr_t)d + bytes; };
-            if (in(v.cand.data(), v.cand.capacity() * 8) || in(v.steerCand.data(), v.steerCand.capacity() * sizeof(SteerTarget)) || in(v.wheelTargets.data(), v.wheelTargets.capacity() * sizeof(WheelTarget)) ||
+            if (in(v.cand.data(), v.cand.capacity() * 8) || in(v.steerCand.data(), v.steerCand.capacity() * sizeof(SteerTarget)) ||
+                in(v.steerPend.data(), v.steerPend.capacity() * sizeof(SteerTarget)) || in(v.wheelTargets.data(), v.wheelTargets.capacity() * sizeof(WheelTarget)) ||
                 in(v.altLists.data(), v.altLists.capacity() * sizeof(v.altLists[0]))) return true;
         }
         return false;
