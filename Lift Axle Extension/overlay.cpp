@@ -73,7 +73,7 @@ void OverlayPublish()
         snprintf(u.name, sizeof(u.name), "%s", v.name);
         u.found = v.found;
         u.scanning = !v.found && (v.scanArmed || v.scanDone || v.scanRunning);
-        u.notRecognised = !v.found && v.detectFails >= 2;
+        u.notRecognised = !v.found && v.detectFails >= 4;   // several lifts in a row without finding it
         u.uncertain = v.uncertain;
         u.probing = v.found && v.probeNeeded && ProbeActive();
         u.canSwap = CanSwapWithNext(s);

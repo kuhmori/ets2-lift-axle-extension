@@ -5,6 +5,7 @@
 ### Fixed
 - The game froze for several seconds while the plugin set itself up (first lift with the game key, first turn for the steering lock). The memory searches now run in the background and the game keeps running. They are also faster.
 - With lifted steered axles, the steering lock setup started over again and again (another freeze each time), because lifted axles never steer and were never found. Each steered axle is now set up on its own, the first time it actually steers; the others are ready right away.
+- After the game rebuilt the truck or trailer (taking a job, loading cargo), individual lifting could stop working for good and the overlay wrongly said the game version may not be supported. A search that misses the lift data is now thrown away and done again on the next lift with the game key, and the search also works when the axles finish lifting before it is done. The "not supported" note only appears after several failed lifts in a row.
 
 ### Changed
 - An axle whose steering data is not found yet shows *setup: steer once* in the overlay.

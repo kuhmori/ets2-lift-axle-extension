@@ -103,6 +103,10 @@ struct ScanJob {
     std::mutex m;
     std::vector<ScanSeries> series;     // game thread updates prev / latest
     std::vector<ScanHit> hits;
+    // lift search only: layout, to still recognise the data once the axles are fully up
+    std::vector<uint8_t> liftPattern;   // per axle (front to back): 1 = lift axle, 0 = not
+    uint32_t liftableWheels = 0;        // bit per wheel index
+    unsigned wheelCount = 0;
 };
 static ScanJob g_job;
 
@@ -121,15 +125,60 @@ static void ScanWorker()
         if (g_job.abort) return false;
         // bands for this chunk from the newest values
         bands.clear();
+        bool restUp = false;                 // lift search: axles stopped fully up
         {
             std::lock_guard<std::mutex> lock(g_job.m);
             for (const ScanSeries& sr : g_job.series) {
+                if (!g_job.steer && sr.valid && sr.latest > sr.maxAbs) restUp = true;
                 if (!sr.valid || std::fabs(sr.latest) < sr.minAbs || std::fabs(sr.latest) > sr.maxAbs) continue;
                 float next = sr.latest + 2.0f * (sr.latest - sr.prev);
                 float lo = std::min(std::min(sr.prev, sr.latest), next) - sr.tol;
                 float hi = std::max(std::max(sr.prev, sr.latest), next) + sr.tol;
                 bands.push_back({ lo, hi, sr.axle, sr.unit });
             }
+        }
+        if (bands.empty() && restUp && !g_job.liftPattern.empty()) {
+            // 1.0 is far too common to collect on its own: only take it where it sits in the
+            // known lift layout (axle list, either order) or in a lift wheel object
+            if (n > buf.size()) buf.resize(n);
+            if (!ReadMem(addr, buf.data(), n)) return true;
+            g_job.scanned += n;
+            const auto& pat = g_job.liftPattern;
+            const unsigned cnt = (unsigned)pat.size();
+            auto at = [&](long long o, float& f) { if (o < 0 || o + 4 > (long long)n) return false; memcpy(&f, &buf[(size_t)o], 4); return true; };
+            const __m128i one = _mm_set1_epi32(0x3F800000);
+            for (size_t off = 0; off + 16 <= n; off += 16) {
+                int m = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_loadu_si128((const __m128i*)&buf[off]), one)));
+                if (!m) continue;
+                for (int k = 0; k < 4; ++k) {
+                    if (!(m & (1 << k))) continue;
+                    long long c = (long long)(off + 4 * k);
+                    // axle list: c is the first lift axle (front-to-back or back-to-front)
+                    for (int rev = 0; rev < 2; ++rev) {
+                        // memory slot q holds axle q (rev = 0) or axle cnt-1-q (rev = 1); fi = first lift slot
+                        unsigned fi = 0;
+                        for (unsigned q = 0; q < cnt; ++q) if (rev ? pat[cnt - 1 - q] : pat[q]) { fi = q; break; }
+                        long long base = c - 4LL * fi;
+                        bool ok = true;
+                        for (unsigned q = 0; q < cnt && ok; ++q) {
+                            bool lift = rev ? pat[cnt - 1 - q] != 0 : pat[q] != 0;
+                            float f; ok = at(base + 4LL * q, f) && f == (lift ? 1.0f : 0.0f);
+                        }
+                        if (!ok) continue;
+                        for (unsigned q = 0; q < cnt; ++q)
+                            if (rev ? pat[cnt - 1 - q] : pat[q]) g_job.hits.push_back({ addr + (size_t)(base + 4LL * q), 0, 0 });
+                    }
+                    // lift wheel object: vtable in the exe at -0x80, wheel index at -0x60, second copy at +0xD0
+                    uint64_t vt = 0; uint32_t idx = 0; float second = 0.0f;
+                    if (c >= 0x80 && (size_t)c + 0xD4 <= n) {
+                        memcpy(&vt, &buf[(size_t)c - 0x80], 8); memcpy(&idx, &buf[(size_t)c - 0x60], 4); memcpy(&second, &buf[(size_t)c + 0xD0], 4);
+                        if (second == 1.0f && idx < g_job.wheelCount && (g_job.liftableWheels >> idx & 1) && InExe(vt))
+                            g_job.hits.push_back({ addr + (size_t)c, 0, 0 });
+                    }
+                }
+                if (g_job.hits.size() >= cap) { overflow = true; return false; }
+            }
+            return true;
         }
         if (bands.empty()) { g_job.skipped += n; return true; }
         float absLo = 1e30f, absHi = 0.0f;
@@ -184,6 +233,15 @@ static void FeedJob(float (*value)(const Vehicle&, const ScanSeries&))
 static void StartJob(bool steer, unsigned slot, unsigned gen, std::vector<ScanSeries> series)
 {
     if (g_job.th.joinable()) g_job.th.join();
+    InExe(0);                                   // module range known before the worker uses it
+    g_job.liftPattern.clear(); g_job.liftableWheels = 0; g_job.wheelCount = 0;
+    if (!steer) {
+        const Vehicle& v = g_vehicles[slot];
+        g_job.liftPattern.assign(v.axleZ.size(), 0);
+        for (const Axle& a : v.axles) if (a.allIndex < v.axleZ.size()) g_job.liftPattern[a.allIndex] = 1;
+        for (unsigned w = 0; w < v.wheelCount && w < 32; ++w) if (v.wheels[w].liftable) g_job.liftableWheels |= 1u << w;
+        g_job.wheelCount = v.wheelCount;
+    }
     Wipe(g_job.hits);
     g_job.series = std::move(series);
     g_job.steer = steer; g_job.slot = slot; g_job.gen = gen;
@@ -324,6 +382,7 @@ static void Detect(Vehicle& v, float L)
     if (wheels.size() > liftWheels) { v.uncertain = true; wheels.clear(); }
     v.wheelTargets = wheels;
     v.found = true;
+    v.detectFails = 0;
     Wipe(v.cand);
     LogInfo("[axlelift] %s: ready (lift data %p%s, %zu wheel objects%s)", v.name, (void*)v.axleList,
             v.listReversed ? ", rear first" : "", v.wheelTargets.size(), v.uncertain ? ", several matches" : "");
@@ -767,7 +826,14 @@ void ScanTick()
         if (v.scanDone && !v.cand.empty() && (std::fabs(L - v.lastL) > 0.005f || (atRest && !lastAtRest))) {
             Refine(v, L, atRest ? 0.001f : 0.0005f);
             v.lastL = L;
-            if (atRest && v.cand.size() <= 1024) Detect(v, L);
+            if (atRest && v.cand.size() <= 1024) {
+                Detect(v, L);
+                if (!v.found) {                  // the search missed the lift data: search again on the next lift
+                    Wipe(v.cand);
+                    v.scanDone = false; v.scanArmed = true;
+                    Notify("%s: lift data not found yet - lift or lower the axles once more with the game key", v.name);
+                }
+            }
             if (!v.found && v.cand.empty()) { v.scanDone = false; v.scanArmed = true; } // lost it: try again
         }
     }

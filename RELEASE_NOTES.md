@@ -3,6 +3,7 @@
 - **Fixed: no more freezes during setup.** Finding the lift data (first lift with the game key) and the steering data (first turn) used to freeze the game for several seconds. Both searches now run in the background – the game keeps running.
 - **Fixed:** with lifted steered axles, the steering lock setup kept starting over (another freeze each time). Each steered axle is now set up on its own, the first time it actually steers. Until then it shows *"setup: steer once"* in the overlay.
 - If one axle's steering data stops working, only that axle is set up again; the other locks keep working.
+- **Fixed:** after taking a job or loading cargo, individual lifting could stop working and the overlay wrongly said the game version may not be supported. The plugin now simply asks for one more lift with the game key and sets itself up again.
 
 New in 1.0.0-beta6: **steering lock** – hold steered trailer axles (and the truck's steered pusher / tag axles) straight, always (*Lock*) or only while reversing (*Reverse*), with smooth centering and release.
 
